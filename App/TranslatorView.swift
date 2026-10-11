@@ -23,8 +23,9 @@ struct TranslatorView: View {
                     languageMenu("내 언어", selection: $interpreter.targetLanguage)
                 }
                 HStack(spacing: 8) {
-                    Circle().fill(interpreter.recording ? Color.green : Color.secondary).frame(width: 7, height: 7)
-                    Text(interpreter.recording ? "계속 듣고 있습니다" : "실시간 대화")
+                    Circle().fill(interpreter.inputPaused ? Color.orange : interpreter.recording ? Color.green : Color.secondary)
+                        .frame(width: 7, height: 7)
+                    Text(interpreter.inputPaused ? "번역 음성 재생 중" : interpreter.recording ? "계속 듣고 있습니다" : "실시간 대화")
                     if interpreter.translating { ProgressView().controlSize(.mini); Text("번역 중") }
                     Spacer()
                     if interpreter.sourceLanguage == "auto", let language = interpreter.detectedLanguage {
@@ -40,7 +41,7 @@ struct TranslatorView: View {
                                     Image(systemName: "airpods").font(.system(size: 44)).foregroundStyle(.teal)
                                     Text(interpreter.recording ? "상대방의 말을 기다리고 있습니다" : "자연스럽게 대화하세요")
                                         .font(.title2.weight(.semibold))
-                                    Text("상대방의 말은 내 언어로 듣고, 내 답변은 상대방 언어로 보여 주세요. 필요하면 iPhone 스피커로 들려줄 수 있습니다.")
+                                    Text("상대방의 말을 듣고 내 언어로 번역합니다. 내 답변도 상대방에게 들려줄 수 있습니다.")
                                         .font(.body).foregroundStyle(.secondary)
                                 }
                                 .padding(24).frame(maxWidth: .infinity, alignment: .leading)
@@ -70,23 +71,28 @@ struct TranslatorView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if !interpreter.ready { modelInstallation }
+                if interpreter.registeringVoice {
+                    ProgressView(value: interpreter.registrationProgress)
+                    Text("다른 사람이 말하지 않는 곳에서 혼자 6초 이상 자연스럽게 말해 주세요.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 routeInformation
                 HStack(spacing: 16) {
                     Image(systemName: "checkmark.shield")
                         .foregroundStyle(interpreter.ready ? Color.green : Color.secondary)
                         .accessibilityLabel(interpreter.ready ? "오프라인 모델 준비됨" : "모델 설치 필요")
                     Button {
-                        if interpreter.recording { interpreter.stop() }
+                        if interpreter.recording || interpreter.registeringVoice { interpreter.stop() }
                         else { Task { await interpreter.start() } }
                     } label: {
-                        Label(interpreter.recording ? "통역 중지" : "통역 시작",
-                            systemImage: interpreter.recording ? "stop.fill" : "mic.fill")
+                        Label(interpreter.registeringVoice ? "등록 중지" : interpreter.recording ? "통역 중지" : "통역 시작",
+                            systemImage: interpreter.recording || interpreter.registeringVoice ? "stop.fill" : "mic.fill")
                             .font(.headline)
                             .foregroundStyle(.white)
                             .frame(maxWidth: .infinity).frame(height: 54)
                             .background(interpreter.recording ? Color.red : Color.teal, in: Capsule())
                     }
-                    .accessibilityLabel(interpreter.recording ? "통역 중지" : "통역 시작")
+                    .accessibilityLabel(interpreter.registeringVoice ? "등록 중지" : interpreter.recording ? "통역 중지" : "통역 시작")
                     .disabled(!interpreter.ready
                         || interpreter.preparing || interpreter.stopping
                         || (!interpreter.recording && interpreter.translating))
@@ -104,6 +110,7 @@ struct TranslatorView: View {
             .background(Color(.systemGroupedBackground))
             .navigationTitle("실시간 번역")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { voiceMenu } }
             .task { await interpreter.prepare() }
             .onChange(of: interpreter.models.downloading) { _, downloading in
                 if !downloading, !interpreter.ready, interpreter.models.installed {
@@ -119,6 +126,7 @@ struct TranslatorView: View {
     }
     private var busy: Bool {
         interpreter.recording || interpreter.preparing || interpreter.stopping || interpreter.translating
+            || interpreter.registeringVoice
     }
     private func languageMenu(_ title: String, selection: Binding<String>, allowsAuto: Bool = false) -> some View {
         Menu {
@@ -144,9 +152,18 @@ struct TranslatorView: View {
     private func name(_ language: String) -> String { SpeechLanguages.label(for: language) }
     private func conversationCard(_ turn: TranslationTurn) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label(turn.isReply ? "내 답변 · \(name(turn.source))" : "상대방 · \(name(turn.source))",
-                systemImage: turn.isReply ? "person.fill" : "ear")
-                .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            HStack {
+                Label(speakerName(turn) + " · \(name(turn.source))",
+                    systemImage: turn.speakerID != nil && turn.speakerID == interpreter.wearerSpeakerID ? "person.fill" : "person.wave.2")
+                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                if let speakerID = turn.speakerID {
+                    Menu {
+                        Button("이 화자를 내 목소리로 지정") { interpreter.selectWearer(speakerID) }
+                    } label: { Image(systemName: "ellipsis").padding(4) }
+                    .accessibilityLabel("화자 지정")
+                }
+            }
             Text(turn.original).font(.body).foregroundStyle(.secondary)
             if !turn.translation.isEmpty {
                 Text(turn.translation).font(.title2).foregroundStyle(turn.isReply ? Color.primary : Color.blue)
@@ -154,8 +171,10 @@ struct TranslatorView: View {
                     Button { interpreter.playReply(turn) } label: {
                         Label("상대방에게 들려주기", systemImage: "speaker.wave.2")
                     }
-                    .font(.subheadline).disabled(interpreter.preparing || interpreter.stopping)
+                    .font(.subheadline).disabled(interpreter.preparing || interpreter.stopping || interpreter.registeringVoice)
                 }
+            } else if turn.target == "auto" {
+                Text("상대방 언어를 확인하면 번역합니다.").font(.footnote).foregroundStyle(.secondary)
             } else if let error = turn.error {
                 Text(error).font(.footnote).foregroundStyle(.orange)
             } else if interpreter.activeTurnID == turn.id && !interpreter.liveTranslation.isEmpty {
@@ -167,6 +186,10 @@ struct TranslatorView: View {
         .textSelection(.enabled).padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 20))
+    }
+    private func speakerName(_ turn: TranslationTurn) -> String {
+        guard let id = turn.speakerID else { return turn.isReply ? "내 언어 발화" : "음성" }
+        return id == interpreter.wearerSpeakerID ? "나" : "화자 \(id)"
     }
     private var modelInstallation: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -187,13 +210,25 @@ struct TranslatorView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
+    private var voiceMenu: some View {
+        Menu {
+            Button(interpreter.wearerSpeakerID == nil ? "내 목소리 등록" : "내 목소리 다시 등록") {
+                Task { await interpreter.registerVoice() }
+            }.disabled(busy || !interpreter.ready)
+            Toggle("내 목소리 제외", isOn: $interpreter.excludeWearer)
+                .disabled(interpreter.wearerSpeakerID == nil)
+            if interpreter.wearerSpeakerID != nil {
+                Button("등록 삭제") { interpreter.forgetWearer() }.disabled(busy)
+            }
+        } label: { Image(systemName: "person.crop.circle") }
+        .accessibilityLabel("내 목소리 설정")
+    }
     private var routeInformation: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Menu {
-                    Text("상대방 음성 수집을 지원하는 AirPods를 우선 사용합니다.")
                     Picker("마이크", selection: $interpreter.microphoneUID) {
-                        Text("자동 · AirPods 상대방 음성").tag("")
+                        Text("자동").tag("")
                         ForEach(interpreter.inputs, id: \.uid) { input in Text(input.portName).tag(input.uid) }
                         if !interpreter.microphoneUID.isEmpty,
                            !interpreter.inputs.contains(where: { $0.uid == interpreter.microphoneUID }) {
@@ -203,15 +238,11 @@ struct TranslatorView: View {
                 } label: { Label(interpreter.actualInput, systemImage: "mic").lineLimit(1) }
                     .disabled(busy)
                 Spacer()
-                Label(interpreter.bluetoothConnected ? "Bluetooth 연결됨" : "iPhone",
-                    systemImage: interpreter.bluetoothConnected ? "airpods" : "iphone")
+                Label(interpreter.actualOutput, systemImage: interpreter.bluetoothConnected ? "airpods" : "speaker.wave.2")
                     .foregroundStyle(.secondary).lineLimit(1)
             }
-            Label("출력 · \(interpreter.actualOutput)", systemImage: "speaker.wave.2")
-                .foregroundStyle(.secondary)
-            Text(interpreter.microphoneMessage).foregroundStyle(.secondary)
             if interpreter.recording {
-                Text(interpreter.duplexMessage).foregroundStyle(.secondary)
+                Text(interpreter.microphoneMessage).foregroundStyle(.secondary)
             }
         }
         .font(.caption)

@@ -7,7 +7,6 @@ final class AudioCapture {
     var suppressInput = false
     var onRouteChanged: (() -> Void)?
     var onFailure: ((String) -> Void)?
-    private(set) var voiceProcessing = false
     private var engine: AVAudioEngine?
     private var pending: [Float] = []
     private var generation = UUID()
@@ -95,7 +94,6 @@ final class AudioCapture {
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
-        voiceProcessing = false
         suppressInput = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         onRouteChanged?()
@@ -121,29 +119,12 @@ final class AudioCapture {
 
     private func installEngine() throws {
         let candidate = AVAudioEngine()
-        // VoIP processing targets the wearer's voice. Let the Bluetooth device's
-        // far-field capture process surrounding speech instead.
-        if AVAudioSession.sharedInstance().currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP }) {
-            try attachTapAndStart(candidate)
-            voiceProcessing = false
-            engine = candidate
-            routeFingerprint = fingerprint()
-            onRouteChanged?()
-            return
-        }
-        do {
-            try candidate.inputNode.setVoiceProcessingEnabled(true)
-            try attachTapAndStart(candidate)
-            voiceProcessing = true
-            engine = candidate
-        } catch {
-            candidate.inputNode.removeTap(onBus: 0)
-            candidate.stop()
-            let fallback = AVAudioEngine()
-            try attachTapAndStart(fallback)
-            voiceProcessing = false
-            engine = fallback
-        }
+        // Preferred Bluetooth input can settle after engine construction. Enabling
+        // VoIP processing on the temporary built-in route also affects the later
+        // AirPods route, suppressing surrounding voices. Capture them unprocessed;
+        // supported AirPods supply their own far-field processing.
+        try attachTapAndStart(candidate)
+        engine = candidate
         routeFingerprint = fingerprint()
         onRouteChanged?()
     }

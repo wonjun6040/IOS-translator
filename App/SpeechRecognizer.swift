@@ -1,7 +1,7 @@
 import Foundation
 import SherpaOnnx
 import SherpaOnnxC
-import NaturalLanguage
+import LlamaSwift
 
 enum SpeechLanguages {
     // Qwen3-ASR's 30 languages; Chinese regional dialects share the Chinese entry.
@@ -31,74 +31,153 @@ enum SpeechLanguages {
 }
 
 actor SpeechRecognizer {
-    private var recognizer: OpaquePointer?
+    static let modelName = "Qwen3-ASR-1.7B-Q4_K_M"
+    private var model: OpaquePointer?
+    private var context: OpaquePointer?
+    private var audioEncoder: OpaquePointer?
+
+    init() { llama_backend_init() }
 
     deinit {
-        if let recognizer { SherpaOnnxDestroyOfflineRecognizer(recognizer) }
+        if let audioEncoder { mtmd_free(audioEncoder) }
+        if let context { llama_free(context) }
+        if let model { llama_model_free(model) }
+        // The backend is shared with translation and lives for the app process.
     }
 
     func load() throws {
-        guard recognizer == nil else { return }
-        let directory = ModelStore.directory
-        // The C API copies configuration strings during construction.
-        let paths = [directory.appendingPathComponent("ASR/conv_frontend.onnx").path,
-                     directory.appendingPathComponent("ASR/encoder.int8.onnx").path,
-                     directory.appendingPathComponent("ASR/decoder.int8.onnx").path,
-                     directory.appendingPathComponent("ASR/tokenizer").path,
-                     "cpu", "", "greedy_search"]
-        let strings = paths.map { strdup($0)! }
-        defer { strings.forEach { free($0) } }
-        var config = SherpaOnnxOfflineRecognizerConfig()
-        config.feat_config.sample_rate = 16000
-        config.feat_config.feature_dim = 80
-        config.model_config.num_threads = 2
-        config.model_config.provider = UnsafePointer(strings[4])
-        config.model_config.tokens = UnsafePointer(strings[5])
-        config.model_config.qwen3_asr.conv_frontend = UnsafePointer(strings[0])
-        config.model_config.qwen3_asr.encoder = UnsafePointer(strings[1])
-        config.model_config.qwen3_asr.decoder = UnsafePointer(strings[2])
-        config.model_config.qwen3_asr.tokenizer = UnsafePointer(strings[3])
-        config.model_config.qwen3_asr.max_total_len = 1024
-        config.model_config.qwen3_asr.max_new_tokens = 256
-        config.model_config.qwen3_asr.temperature = 0.000001
-        config.model_config.qwen3_asr.top_p = 0.8
-        config.model_config.qwen3_asr.seed = 42
-        config.model_config.qwen3_asr.hotwords = UnsafePointer(strings[5])
-        config.decoding_method = UnsafePointer(strings[6])
-        guard let loaded = SherpaOnnxCreateOfflineRecognizer(&config) else {
-            throw InterpreterError.message("Qwen 음성 인식 모델을 불러오지 못했습니다.")
+        guard context == nil else { return }
+        let directory = ModelStore.directory.appendingPathComponent("ASR")
+        var modelParams = llama_model_default_params()
+        modelParams.n_gpu_layers = 0
+        guard let loadedModel = llama_model_load_from_file(
+            directory.appendingPathComponent("Qwen3-ASR-1.7B.Q4_K_M.gguf").path, modelParams) else {
+            throw InterpreterError.message("음성 인식 모델을 불러오지 못했습니다.")
         }
-        recognizer = loaded
+        var params = llama_context_default_params()
+        params.n_ctx = 1024
+        params.n_batch = 256
+        params.n_ubatch = 256
+        params.n_threads = 2
+        params.n_threads_batch = 2
+        params.offload_kqv = false
+        params.op_offload = false
+        guard let loadedContext = llama_init_from_model(loadedModel, params) else {
+            llama_model_free(loadedModel)
+            throw InterpreterError.message("음성 인식에 필요한 메모리를 확보하지 못했습니다.")
+        }
+        var audioParams = mtmd_context_params_default()
+        audioParams.use_gpu = false
+        audioParams.n_threads = 2
+        audioParams.warmup = false
+        guard let loadedEncoder = mtmd_init_from_file(
+            directory.appendingPathComponent("Qwen3-ASR-1.7B.mmproj-Q8_0.gguf").path,
+            loadedModel, audioParams) else {
+            llama_free(loadedContext)
+            llama_model_free(loadedModel)
+            throw InterpreterError.message("음성 처리 모델을 불러오지 못했습니다.")
+        }
+        guard mtmd_support_audio(loadedEncoder), mtmd_get_audio_sample_rate(loadedEncoder) == 16000 else {
+            mtmd_free(loadedEncoder)
+            llama_free(loadedContext)
+            llama_model_free(loadedModel)
+            throw InterpreterError.message("음성 모델의 입력 형식이 맞지 않습니다.")
+        }
+        model = loadedModel
+        context = loadedContext
+        audioEncoder = loadedEncoder
     }
 
-    func transcribe(_ samples: [Float]) throws -> (text: String, language: String?) {
+    func transcribe(_ samples: [Float], languageHint: String? = nil) throws -> (text: String, language: String?) {
         try Task.checkCancellation()
-        guard let recognizer, let stream = SherpaOnnxCreateOfflineStream(recognizer) else {
+        guard !samples.isEmpty else { return ("", nil) }
+        guard let model, let context, let audioEncoder, let vocab = llama_model_get_vocab(model) else {
             throw InterpreterError.message("음성 인식이 준비되지 않았습니다.")
         }
-        defer { SherpaOnnxDestroyOfflineStream(stream) }
-        samples.withUnsafeBufferPointer { SherpaOnnxAcceptWaveformOffline(stream, 16000, $0.baseAddress, Int32($0.count)) }
-        SherpaOnnxDecodeOfflineStream(recognizer, stream)
-        try Task.checkCancellation()
-        guard let result = SherpaOnnxGetOfflineStreamResult(stream) else {
-            throw InterpreterError.message("음성을 인식하지 못했습니다.")
+        guard let bitmap = samples.withUnsafeBufferPointer({ mtmd_bitmap_init_from_audio($0.count, $0.baseAddress) }) else {
+            throw InterpreterError.message("입력 음성을 처리하지 못했습니다.")
         }
-        defer { SherpaOnnxDestroyOfflineRecognizerResult(result) }
-        let text = (result.pointee.text.map { String(cString: $0) } ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let raw = result.pointee.lang.map { String(cString: $0).lowercased() } ?? ""
-        var language = SpeechLanguages.code(for: raw)
-        // sherpa-onnx 1.13.8 strips Qwen's language prefix without filling result.lang.
-        // Identify the decoded text locally when that field is absent.
-        if language == nil, !text.isEmpty {
-            let identifier = NLLanguageRecognizer()
-            identifier.processString(text)
-            if let candidate = identifier.languageHypotheses(withMaximum: 1).first,
-               candidate.value >= 0.65 {
-                language = SpeechLanguages.code(for: candidate.key.rawValue)
+        defer { mtmd_bitmap_free(bitmap) }
+        guard let chunks = mtmd_input_chunks_init() else {
+            throw InterpreterError.message("입력 음성을 처리하지 못했습니다.")
+        }
+        defer { mtmd_input_chunks_free(chunks) }
+        let languageName = SpeechLanguages.supported.first { $0.code == languageHint }?.name
+        // Qwen's own ASR template, including its acoustic language prediction.
+        let prefix = languageName.map { "language \($0)<asr_text>" } ?? ""
+        let prompt = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n"
+            + String(cString: mtmd_default_marker())
+            + "<|im_end|>\n<|im_start|>assistant\n" + prefix
+        let result = prompt.withCString { pointer in
+            var input = mtmd_input_text(text: pointer, text_len: prompt.utf8.count,
+                add_special: false, parse_special: true)
+            var bitmaps: [OpaquePointer?] = [bitmap]
+            return bitmaps.withUnsafeMutableBufferPointer {
+                mtmd_tokenize(audioEncoder, chunks, &input, $0.baseAddress, $0.count)
             }
         }
-        return (text, language)
+        let outputLimit = 256
+        guard result == 0 else {
+            throw InterpreterError.message("입력 음성을 처리하지 못했습니다.")
+        }
+        guard Int(mtmd_helper_get_n_pos(chunks)) + outputLimit <= Int(llama_n_ctx(context)) else {
+            throw InterpreterError.message("입력 음성이 너무 깁니다. 잠시 끊어서 말씀해 주세요.")
+        }
+        llama_memory_clear(llama_get_memory(context), true)
+        defer { llama_memory_clear(llama_get_memory(context), true) }
+        var position: llama_pos = 0
+        guard mtmd_helper_eval_chunks(audioEncoder, context, chunks, 0, 0, 256, true, &position) == 0 else {
+            throw InterpreterError.message("음성 인식 처리가 실패했습니다.")
+        }
+        try Task.checkCancellation()
+        guard let sampler = llama_sampler_init_greedy() else {
+            throw InterpreterError.message("음성 인식 처리가 준비되지 않았습니다.")
+        }
+        defer { llama_sampler_free(sampler) }
+        var batch = llama_batch_init(1, 0, 1)
+        defer { llama_batch_free(batch) }
+        var bytes: [UInt8] = []
+        var completed = false
+        for _ in 0..<outputLimit {
+            try Task.checkCancellation()
+            let token = llama_sampler_sample(sampler, context, -1)
+            if llama_vocab_is_eog(vocab, token) { completed = true; break }
+            var piece = [CChar](repeating: 0, count: 256)
+            var length = piece.withUnsafeMutableBufferPointer {
+                llama_token_to_piece(vocab, token, $0.baseAddress, Int32($0.count), 0, true)
+            }
+            if length < 0 {
+                piece = [CChar](repeating: 0, count: Int(-length))
+                length = piece.withUnsafeMutableBufferPointer {
+                    llama_token_to_piece(vocab, token, $0.baseAddress, Int32($0.count), 0, true)
+                }
+            }
+            guard length >= 0 else { throw InterpreterError.message("음성 인식 결과를 읽지 못했습니다.") }
+            bytes.append(contentsOf: piece.prefix(Int(length)).map { UInt8(bitPattern: $0) })
+            batch.n_tokens = 1
+            batch.token[0] = token
+            batch.pos[0] = position
+            batch.n_seq_id[0] = 1
+            batch.seq_id[0]![0] = 0
+            batch.logits[0] = 1
+            guard llama_decode(context, batch) == 0 else {
+                throw InterpreterError.message("음성 인식 처리가 실패했습니다.")
+            }
+            position += 1
+        }
+        guard completed, let decoded = String(bytes: bytes, encoding: .utf8) else {
+            throw InterpreterError.message("음성 인식을 끝내지 못했습니다. 다시 말씀해 주세요.")
+        }
+        if decoded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return ("", languageHint) }
+        let output = prefix + decoded
+        guard let marker = output.range(of: "<asr_text>") else {
+            throw InterpreterError.message("음성 인식 결과의 형식이 맞지 않습니다.")
+        }
+        let rawLanguage = String(output[..<marker.lowerBound])
+            .replacingOccurrences(of: "language ", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = String(output[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (text, SpeechLanguages.code(for: rawLanguage))
     }
 }
 
@@ -121,9 +200,9 @@ actor SpeechDetector {
         defer { free(path); free(provider) }
         var config = SherpaOnnxVadModelConfig()
         config.silero_vad.model = UnsafePointer(path)
-        config.silero_vad.threshold = 0.35
-        config.silero_vad.min_speech_duration = 0.15
-        config.silero_vad.min_silence_duration = 0.65
+        config.silero_vad.threshold = 0.30
+        config.silero_vad.min_speech_duration = 0.10
+        config.silero_vad.min_silence_duration = 0.90
         config.silero_vad.window_size = 512
         config.silero_vad.max_speech_duration = 12
         config.sample_rate = 16000

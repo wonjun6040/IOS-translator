@@ -12,6 +12,7 @@
 		1336520AAB211077DD9B772B /* TranslatorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6936A4B2C84EEB5DAA3B79D4 /* TranslatorView.swift */; };
 		1549E4B699E4B2759C13F938 /* NOTICE in Resources */ = {isa = PBXBuildFile; fileRef = 6288548BB16E16071D31696A /* NOTICE */; };
 		1B51019BD0F03C3B0451FD20 /* ModelStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C13F665632028E777990F87 /* ModelStore.swift */; };
+		6E55D5C51AB6C4D2A1010F14 /* SpeakerRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 232EFBFD64C54D411AA65F2D /* SpeakerRecognizer.swift */; };
 		9A64A048E566AABDFEF870D9 /* AudioCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5876AB349B75030675C9142A /* AudioCapture.swift */; };
 		A9EB91FEB2F613B263B70CB3 /* LocalTranslator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16C99579B83F749CBAEF0975 /* LocalTranslator.swift */; };
 		C338CEBBA477F138B9CA169A /* Interpreter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A18CB087611754C1AC2E5312 /* Interpreter.swift */; };
@@ -22,6 +23,7 @@
 
 /* Begin PBXFileReference section */
 		16C99579B83F749CBAEF0975 /* LocalTranslator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalTranslator.swift; sourceTree = "<group>"; };
+		232EFBFD64C54D411AA65F2D /* SpeakerRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeakerRecognizer.swift; sourceTree = "<group>"; };
 		4C13F665632028E777990F87 /* ModelStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelStore.swift; sourceTree = "<group>"; };
 		5876AB349B75030675C9142A /* AudioCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioCapture.swift; sourceTree = "<group>"; };
 		5D820B64E1F00A788E2F72B5 /* SpeechRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechRecognizer.swift; sourceTree = "<group>"; };
@@ -64,6 +66,7 @@
 				A5C1552A2A1A5B6E37E84E03 /* IOSTranslatorApp.swift */,
 				16C99579B83F749CBAEF0975 /* LocalTranslator.swift */,
 				4C13F665632028E777990F87 /* ModelStore.swift */,
+				232EFBFD64C54D411AA65F2D /* SpeakerRecognizer.swift */,
 				5D820B64E1F00A788E2F72B5 /* SpeechRecognizer.swift */,
 				6936A4B2C84EEB5DAA3B79D4 /* TranslatorView.swift */,
 			);
@@ -162,6 +165,7 @@
 				C338CEBBA477F138B9CA169A /* Interpreter.swift in Sources */,
 				A9EB91FEB2F613B263B70CB3 /* LocalTranslator.swift in Sources */,
 				1B51019BD0F03C3B0451FD20 /* ModelStore.swift in Sources */,
+				6E55D5C51AB6C4D2A1010F14 /* SpeakerRecognizer.swift in Sources */,
 				07CD71E3CF465FF29EB73623 /* SpeechRecognizer.swift in Sources */,
 				1336520AAB211077DD9B772B /* TranslatorView.swift in Sources */,
 			);
@@ -177,6 +181,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 7NKRY3W5J2;
 				INFOPLIST_FILE = App/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -224,7 +229,6 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = 7NKRY3W5J2;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
@@ -283,7 +287,6 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = 7NKRY3W5J2;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
@@ -321,6 +324,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 7NKRY3W5J2;
 				INFOPLIST_FILE = App/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

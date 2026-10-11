@@ -14,8 +14,9 @@ struct TranslationTurn: Identifiable {
     let id = UUID()
     let original: String
     let source: String
-    let target: String
+    var target: String
     let isReply: Bool
+    var speakerID: Int? = nil
     var translation = ""
     var error: String?
 }
@@ -25,6 +26,10 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
     let models = ModelStore()
     var sourceLanguage = "auto"
     var targetLanguage = "ko"
+    var excludeWearer = false
+    private(set) var wearerSpeakerID: Int?
+    private(set) var registeringVoice = false
+    private(set) var registrationProgress: Double = 0
     var speakTranslation = true {
         didSet { if !speakTranslation { synthesizer.stopSpeaking(at: .immediate) } }
     }
@@ -37,6 +42,7 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
     private(set) var ready = false
     private(set) var preparing = false
     private(set) var recording = false
+    private(set) var inputPaused = false
     private(set) var stopping = false
     private(set) var partial = ""
     private(set) var partialLanguage: String?
@@ -50,13 +56,13 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
     private(set) var actualOutput = "대기 중"
     private(set) var bluetoothConnected = false
     private(set) var microphoneMessage = ""
-    private(set) var duplexMessage = "스피커 재생 중에는 음성 인식을 잠시 제외합니다."
     var message: String? {
         didSet { if let message { log("error", ["message": message]) } }
     }
     private let audio = AudioCapture()
     private let recognition = SpeechRecognizer()
     private let detector = SpeechDetector()
+    private let speakers = SpeakerRecognizer()
     private let translator = LocalTranslator()
     private let synthesizer = AVSpeechSynthesizer()
     private var captureTask: Task<Void, Never>?
@@ -68,6 +74,8 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
     private var previewText = ""
     private var liveTranslationID = UUID()
     private var gateTask: Task<Void, Never>?
+    private var registrationTask: Task<Void, Never>?
+    private var registrationID = UUID()
     private var finalized: [[Float]] = []
     private var translations: [TranslationTurn] = []
     private var sessionID = UUID()
@@ -99,22 +107,25 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         message = nil
         defer { preparing = false }
         do {
-            if download { try await models.download() }
+            if download || models.recognitionUpdateAvailable { try await models.download() }
             guard models.installed else { return }
             try await detector.load()
             try await recognition.load()
+            log("asr_model_loaded", ["model": SpeechRecognizer.modelName])
+            try await speakers.load()
+            wearerSpeakerID = await speakers.wearerID()
             try await translator.load()
             log("translation_model_loaded", ["model": LocalTranslator.modelName])
             do {
-                let removed = try models.removeReplacedTranslationModel()
-                if removed > 0 { log("obsolete_model_removed", ["bytes": removed]) }
-            } catch { log("model_cleanup_error", ["error": error.localizedDescription]) }
+                let bytes = try models.pruneModelCache()
+                if bytes > 0 { log("model_cache_pruned", ["bytes": bytes]) }
+            } catch { log("model_cache_cleanup_failed", ["message": error.localizedDescription]) }
             ready = true
         } catch { ready = false; message = error.localizedDescription }
     }
 
     func start() async {
-        guard ready, !recording, !stopping, !preparing, !translating else { return }
+        guard ready, !recording, !stopping, !preparing, !translating, !registeringVoice else { return }
         guard sourceLanguage != targetLanguage else { message = "서로 다른 입력·출력 언어를 선택해 주세요."; return }
         preparing = true
         let operation = UUID()
@@ -140,17 +151,28 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         do {
             try audio.start()
             recording = true
+            inputPaused = false
             preparing = false
             log("session_start", ["source": sourceLanguage, "target": targetLanguage,
                 "device": UIDevice.current.model, "os": UIDevice.current.systemVersion,
-                "translation_model": LocalTranslator.modelName])
+                "wearer": wearerSpeakerID ?? 0,
+                "exclude_wearer": excludeWearer,
+                "asr_model": SpeechRecognizer.modelName, "translation_model": LocalTranslator.modelName])
             captureTask = Task { [weak self] in await self?.captureLoop(id: operation) }
         } catch { preparing = false; message = error.localizedDescription; audio.stop() }
     }
 
     func stop() {
+        if registeringVoice {
+            registrationID = UUID()
+            registrationTask?.cancel()
+            audio.stop()
+            if registrationTask == nil { registeringVoice = false }
+            return
+        }
         guard recording || preparing else { return }
         recording = false
+        inputPaused = false
         previewTranslationTask?.cancel()
         previewRevision += 1
         previewSamples.removeAll()
@@ -165,6 +187,75 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         audio.stop()
         // The loop drains captured audio and the VAD endpoint before ending the session.
         if captureTask == nil, recognitionTask == nil { sessionID = UUID(); preparing = false; stopping = false }
+    }
+
+    func registerVoice() async {
+        guard ready, !recording, !preparing, !stopping, !translating, !registeringVoice else { return }
+        registeringVoice = true
+        let operation = UUID()
+        registrationID = operation
+        registrationProgress = 0
+        message = nil
+        let allowed = await AVAudioApplication.requestRecordPermission()
+        guard registrationID == operation, registeringVoice else { return }
+        guard allowed else {
+            registeringVoice = false
+            message = "마이크 권한이 필요합니다."
+            return
+        }
+        await detector.reset()
+        guard registrationID == operation, registeringVoice else { return }
+        do { try audio.start() }
+        catch { registeringVoice = false; message = error.localizedDescription; audio.stop(); return }
+        registrationTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.audio.stop()
+                self.registrationTask = nil
+                self.registeringVoice = false
+            }
+            let started = Date()
+            var speech: [Float] = []
+            while !Task.isCancelled, self.registrationID == operation, Date().timeIntervalSince(started) < 25 {
+                let segment = await self.detector.segment(self.audio.takeSamples())
+                for samples in segment.final { speech.append(contentsOf: samples) }
+                let available = speech.count + segment.partial.count
+                self.registrationProgress = min(1, Double(available) / 96_000)
+                if available >= 96_000 {
+                    let samples = Array((speech + segment.partial).prefix(96_000))
+                    do {
+                        let identity = try await self.speakers.registerWearer(samples)
+                        guard !Task.isCancelled, self.registrationID == operation else { return }
+                        self.wearerSpeakerID = identity
+                        self.log("wearer_registered", ["speaker": identity, "input": self.actualInput])
+                    } catch { if !Task.isCancelled { self.message = error.localizedDescription } }
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            if !Task.isCancelled { self.message = "음성이 충분하지 않습니다. 6초 이상 말하며 다시 등록해 주세요." }
+        }
+    }
+
+    func selectWearer(_ speakerID: Int) {
+        Task {
+            do {
+                try await speakers.saveWearer(speakerID)
+                wearerSpeakerID = speakerID
+                log("wearer_selected", ["speaker": speakerID])
+            } catch { message = error.localizedDescription }
+        }
+    }
+
+    func forgetWearer() {
+        Task {
+            do {
+                try await speakers.forgetWearer()
+                wearerSpeakerID = nil
+                excludeWearer = false
+                log("wearer_forgotten", [:])
+            } catch { message = error.localizedDescription }
+        }
     }
 
     private func captureLoop(id: UUID) async {
@@ -205,7 +296,7 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
     private func recognizePending(id: UUID) {
         guard recognitionTask == nil else { return }
         let interval = max(0.75, min(2, previewDuration * 1.25))
-        guard !finalized.isEmpty || (recording && previewSamples.count >= 9_600
+        guard !finalized.isEmpty || (recording && previewSamples.count >= 24_000
             && Date().timeIntervalSince(previewAt) >= interval) else { return }
         recognitionTask = Task { [weak self] in
             guard let self else { return }
@@ -219,41 +310,79 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
             while self.sessionID == id, !Task.isCancelled {
                 let final = !self.finalized.isEmpty
                 let interval = max(0.75, min(2, self.previewDuration * 1.25))
-                guard final || (self.recording && self.previewSamples.count >= 9_600
+                guard final || (self.recording && self.previewSamples.count >= 24_000
                     && Date().timeIntervalSince(self.previewAt) >= interval) else { return }
                 let revision = self.previewRevision
                 let samples = final ? self.finalized.removeFirst() : self.previewSamples
                 if !final { self.previewSamples.removeAll(); self.previewAt = Date() }
                 let started = Date()
                 do {
-                    let result = try await self.recognition.transcribe(samples)
-                    guard self.sessionID == id else { return }
-                    let duration = Date().timeIntervalSince(started)
-                    self.log(final ? "asr_final" : "asr_interim", ["text": result.text,
-                        "language": result.language ?? "unknown", "audio_seconds": Double(samples.count) / 16000,
-                        "processing_seconds": duration, "pending_asr": self.finalized.count])
+                    let parts: [SpeakerAudio]
                     if final {
-                        if !result.text.isEmpty {
-                            if let pair = self.languagePair(detected: result.language) {
-                                if !pair.reply { self.detectedLanguage = pair.source }
-                                let turn = TranslationTurn(original: result.text, source: pair.source,
-                                    target: pair.target, isReply: pair.reply)
-                                self.turns.append(turn)
-                                self.translations.append(turn)
-                                self.translatePending(id: id)
-                            } else {
-                                self.message = "이 발화의 언어를 확인하지 못했습니다. 상대방 언어를 직접 선택해 주세요."
-                            }
-                        }
+                        parts = try await self.speakers.split(samples)
+                        self.log("speaker_segments", ["processing_seconds": Date().timeIntervalSince(started),
+                            "parts": parts.map { ["speaker": $0.speaker ?? 0,
+                                "similarity": $0.similarity ?? -1,
+                                "audio_seconds": Double($0.samples.count) / 16_000] as [String: Any] }])
                     } else {
-                        self.previewDuration = Date().timeIntervalSince(started)
-                        guard self.recording, self.previewRevision == revision,
-                              !self.audio.suppressInput else { continue }
-                        self.partial = result.text
-                        self.partialLanguage = result.language
-                        if let pair = self.languagePair(detected: result.language) {
-                            self.translatePreview(result.text, source: pair.source, target: pair.target,
-                                id: id, revision: revision)
+                        let speaker = await self.speakers.interimSpeaker(samples)
+                        parts = [SpeakerAudio(samples: samples, speaker: speaker, similarity: nil)]
+                    }
+                    guard self.sessionID == id else { return }
+                    for part in parts {
+                        let wearer: Bool? = part.speaker.flatMap { speaker in
+                            self.wearerSpeakerID.map { $0 == speaker }
+                        }
+                        if self.excludeWearer && wearer == true {
+                            self.log("wearer_excluded", ["speaker": part.speaker ?? 0,
+                                "audio_seconds": Double(part.samples.count) / 16_000])
+                            if !final { self.partial = ""; self.liveTranslation = "" }
+                            continue
+                        }
+                        let hint = self.sourceLanguage != "auto"
+                            && wearer == false ? self.sourceLanguage : nil
+                        let decodeStarted = Date()
+                        let result = try await self.recognition.transcribe(part.samples, languageHint: hint)
+                        guard self.sessionID == id else { return }
+                        let duration = Date().timeIntervalSince(started)
+                        let energy = part.samples.reduce(Double(0)) { $0 + Double($1) * Double($1) }
+                        let rms = sqrt(energy / Double(max(1, part.samples.count)))
+                        let peak = part.samples.reduce(Float(0)) { max($0, abs($1)) }
+                        self.log(final ? "asr_final" : "asr_interim", ["text": result.text,
+                            "language": result.language ?? "unknown", "audio_seconds": Double(part.samples.count) / 16000,
+                            "processing_seconds": Date().timeIntervalSince(decodeStarted),
+                            "pipeline_seconds": duration, "speaker": part.speaker ?? 0,
+                            "language_hint": hint ?? "auto", "pending_asr": self.finalized.count,
+                            "input_rms_dbfs": 20 * log10(max(rms, 0.000000001)), "input_peak": peak])
+                        if final {
+                            if !result.text.isEmpty {
+                                if let pair = self.languagePair(detected: result.language, wearer: wearer) {
+                                    if !pair.reply {
+                                        self.detectedLanguage = pair.source
+                                        for index in self.turns.indices where self.turns[index].target == "auto" {
+                                            self.turns[index].target = pair.source
+                                            self.translations.append(self.turns[index])
+                                        }
+                                    }
+                                    let turn = TranslationTurn(original: result.text, source: pair.source,
+                                        target: pair.target, isReply: pair.reply, speakerID: part.speaker)
+                                    self.turns.append(turn)
+                                    if turn.target != "auto" { self.translations.append(turn) }
+                                    self.translatePending(id: id)
+                                } else {
+                                    self.message = "이 발화의 언어를 확인하지 못했습니다. 상대방 언어를 직접 선택해 주세요."
+                                }
+                            }
+                        } else {
+                            self.previewDuration = Date().timeIntervalSince(started)
+                            guard self.recording, self.previewRevision == revision,
+                                  !self.audio.suppressInput else { continue }
+                            self.partial = result.text
+                            self.partialLanguage = result.language
+                            if let pair = self.languagePair(detected: result.language, wearer: wearer) {
+                                self.translatePreview(result.text, source: pair.source, target: pair.target,
+                                    id: id, revision: revision)
+                            }
                         }
                     }
                 } catch {
@@ -266,20 +395,23 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         }
     }
 
-    private func languagePair(detected: String?) -> (source: String, target: String, reply: Bool)? {
+    private func languagePair(detected: String?, wearer: Bool? = nil) -> (source: String, target: String, reply: Bool)? {
         let language = detected ?? (sourceLanguage == "auto" ? nil : sourceLanguage)
         guard let language else { return nil }
-        if language == targetLanguage {
+        if wearer == true || (wearer == nil && language == targetLanguage) {
             let partner = sourceLanguage == "auto" ? detectedLanguage : sourceLanguage
-            guard let partner, partner != language else { return nil }
-            return (language, partner, true)
+            // The wearer may speak first while the partner's language is still
+            // unknown. Keep that transcript and translate after a partner speaks.
+            return (language, partner ?? "auto", true)
         }
+        if wearer == false { return (language, targetLanguage, false) }
         guard sourceLanguage == "auto" || language == sourceLanguage
             || (sourceLanguage == "yue" && language == "zh") else { return nil }
         return (sourceLanguage == "auto" ? language : sourceLanguage, targetLanguage, false)
     }
 
     private func translatePreview(_ text: String, source: String, target: String, id: UUID, revision: Int) {
+        guard source != target, target != "auto" else { liveTranslation = ""; return }
         guard !text.isEmpty, text != previewText, translationTask == nil,
               previewTranslationTask == nil else { return }
         previewText = text
@@ -326,7 +458,7 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
                 self.log("translation_start", ["turn": utterance.id.uuidString,
                     "source": utterance.source, "target": utterance.target, "original": utterance.original])
                 do {
-                    let result = try await self.translator.translate(text: utterance.original,
+                    let result = utterance.source == utterance.target ? utterance.original : try await self.translator.translate(text: utterance.original,
                         sourceLanguageCode: utterance.source, targetLanguageCode: utterance.target) { [weak self] value in
                         Task { @MainActor in
                             guard let self, self.sessionID == id, self.liveTranslationID == liveID,
@@ -344,7 +476,8 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
                         "source": utterance.source, "target": utterance.target, "original": utterance.original,
                         "translation": result, "processing_seconds": Date().timeIntervalSince(started)])
                     self.message = nil
-                    if self.recording && self.speakTranslation && !utterance.isReply && self.speakerUtteranceID == nil {
+                    if self.recording && self.speakTranslation && !utterance.isReply
+                        && utterance.source != utterance.target && self.speakerUtteranceID == nil {
                         guard let voice = self.voice(for: utterance.target) else {
                             self.message = "출력 언어의 iOS 음성이 없습니다. 번역문만 표시합니다."
                             continue
@@ -397,22 +530,19 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         let headphoneOutput = session.currentRoute.outputs.allSatisfy {
             [.bluetoothHFP, .bluetoothA2DP, .bluetoothLE, .headphones].contains($0.portType)
         } && !session.currentRoute.outputs.isEmpty
-        safeDuplex = headphoneOutput && (audio.voiceProcessing || audio.farFieldInputEnabled)
-        duplexMessage = safeDuplex
-            ? "이어폰 출력 중에도 마이크 입력을 유지합니다."
-            : "음성 출력 중에는 인식을 잠시 제외합니다. 이 구간의 다음 발화는 인식하지 못할 수 있습니다."
-        let route = "\(actualInput)/\(actualOutput)/\(audio.farFieldInputEnabled)/\(audio.voiceProcessing)"
+        safeDuplex = headphoneOutput && audio.farFieldInputEnabled
+        let route = "\(actualInput)/\(actualOutput)/\(audio.farFieldInputEnabled)"
         if route != lastLoggedRoute {
             lastLoggedRoute = route
             log("audio_route", ["input": actualInput, "output": actualOutput,
                 "far_field_supported": audio.farFieldInputSupported, "far_field_enabled": audio.farFieldInputEnabled,
-                "voice_processing": audio.voiceProcessing, "duplex": safeDuplex])
+                "duplex": safeDuplex])
         }
         if !spoken.isEmpty { updateInputGate(speaking: true) }
     }
 
     func playReply(_ turn: TranslationTurn) {
-        guard turn.isReply, !turn.translation.isEmpty, !preparing, !stopping else { return }
+        guard turn.isReply, !turn.translation.isEmpty, !preparing, !stopping, !registeringVoice else { return }
         guard let voice = voice(for: turn.target) else {
             message = "이 언어의 iOS 음성이 없습니다. 번역문을 상대방에게 보여 주세요."
             return
@@ -481,12 +611,14 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         gateTask?.cancel()
         if speaking {
             audio.suppressInput = !safeDuplex
+            inputPaused = recording && audio.suppressInput
             if audio.suppressInput { partial = "" }
         } else {
             gateTask = Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(350))
                 guard !Task.isCancelled, let self else { return }
                 self.audio.suppressInput = false
+                self.inputPaused = false
             }
         }
     }

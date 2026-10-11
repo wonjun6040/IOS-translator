@@ -4,14 +4,12 @@ import Observation
 @MainActor @Observable
 final class ModelStore: NSObject, URLSessionDownloadDelegate {
     nonisolated static let assets: [(path: String, url: String, size: Int64)] = [
-        ("ASR/conv_frontend.onnx", "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/68818b2313fe77bd06f6a7c5068ff3ef59d02b8a/conv_frontend.onnx", 44_148_281),
-        ("ASR/encoder.int8.onnx", "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/68818b2313fe77bd06f6a7c5068ff3ef59d02b8a/encoder.int8.onnx", 182_491_662),
-        ("ASR/decoder.int8.onnx", "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/68818b2313fe77bd06f6a7c5068ff3ef59d02b8a/decoder.int8.onnx", 755_914_231),
-        ("ASR/tokenizer/merges.txt", "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/68818b2313fe77bd06f6a7c5068ff3ef59d02b8a/tokenizer/merges.txt", 1_671_853),
-        ("ASR/tokenizer/tokenizer_config.json", "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/68818b2313fe77bd06f6a7c5068ff3ef59d02b8a/tokenizer/tokenizer_config.json", 12_487),
-        ("ASR/tokenizer/vocab.json", "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/68818b2313fe77bd06f6a7c5068ff3ef59d02b8a/tokenizer/vocab.json", 2_776_833),
+        ("ASR/Qwen3-ASR-1.7B.Q4_K_M.gguf", "https://huggingface.co/mradermacher/Qwen3-ASR-1.7B-GGUF/resolve/cc946c78d3804752f7ba1bc42720c0f7aaf3d1ad/Qwen3-ASR-1.7B.Q4_K_M.gguf", 1_282_435_552),
+        ("ASR/Qwen3-ASR-1.7B.mmproj-Q8_0.gguf", "https://huggingface.co/mradermacher/Qwen3-ASR-1.7B-GGUF/resolve/cc946c78d3804752f7ba1bc42720c0f7aaf3d1ad/Qwen3-ASR-1.7B.mmproj-Q8_0.gguf", 355_709_472),
         ("silero_vad.onnx", "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx", 643_854),
-        ("Hy-MT2-1.8B-Q4_K_M.gguf", "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/a0c709d9fac510f2c807aa3af52872340dc37a4a/Hy-MT2-1.8B-Q4_K_M.gguf", 1_133_080_448)
+        ("Hy-MT2-1.8B-Q4_K_M.gguf", "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/a0c709d9fac510f2c807aa3af52872340dc37a4a/Hy-MT2-1.8B-Q4_K_M.gguf", 1_133_080_448),
+        ("Speaker/segmentation.int8.onnx", "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/9403a6902bb58e3d5ae8c7e77c3422de279db2e0/model.int8.onnx", 1_540_506),
+        ("Speaker/campplus.onnx", "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx", 28_281_164)
     ]
     nonisolated static var directory: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -19,7 +17,13 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
     }
     var downloading = false
     var progress: Double = 0
-    var message = "최초 모델 설치에 약 2.12 GB가 필요합니다."
+    var message = "최초 모델 설치에 약 2.80 GB가 필요합니다."
+    var recognitionUpdateAvailable: Bool {
+        !installed && Self.assets.filter { !$0.path.hasPrefix("Speaker/") && !$0.path.hasPrefix("ASR/") }.allSatisfy { asset in
+            let size = try? Self.directory.appendingPathComponent(asset.path).resourceValues(forKeys: [.fileSizeKey]).fileSize
+            return Int64(size ?? 0) == asset.size
+        }
+    }
     var installed: Bool {
         Self.assets.allSatisfy { asset in
             let size = try? Self.directory.appendingPathComponent(asset.path).resourceValues(forKeys: [.fileSizeKey]).fileSize
@@ -32,12 +36,20 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
             return bytes + (Int64(size ?? 0) == asset.size ? 0 : asset.size)
         }
     }
-    func removeReplacedTranslationModel() throws -> Int64 {
-        let oldModel = Self.directory.appendingPathComponent("Qwen3-0.6B.Q4_K_M.gguf")
-        guard FileManager.default.fileExists(atPath: oldModel.path) else { return 0 }
-        let size = try oldModel.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-        try FileManager.default.removeItem(at: oldModel)
-        return Int64(size)
+
+    /// Only discard unused files in the app's model cache after all active models loaded.
+    func pruneModelCache() throws -> Int64 {
+        let active = Set(Self.assets.map { Self.directory.appendingPathComponent($0.path).standardizedFileURL.path })
+        guard installed, let files = FileManager.default.enumerator(at: Self.directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey]) else { return 0 }
+        var removedBytes: Int64 = 0
+        for case let file as URL in files {
+            let values = try file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard values.isRegularFile == true, !active.contains(file.standardizedFileURL.path) else { continue }
+            try FileManager.default.removeItem(at: file)
+            removedBytes += Int64(values.fileSize ?? 0)
+        }
+        return removedBytes
     }
     private var session: URLSession!
     private var waiter: CheckedContinuation<Void, Error>?
@@ -59,7 +71,10 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
 
     private func restoreDownloads() async {
         let tasks = await session.allTasks
-        activePaths.formUnion(tasks.filter { $0.state == .running || $0.state == .suspended }
+        let paths = Set(Self.assets.map(\.path))
+        for task in tasks where !paths.contains(task.taskDescription ?? "") { task.cancel() }
+        activePaths.formUnion(tasks.filter { paths.contains($0.taskDescription ?? "")
+            && ($0.state == .running || $0.state == .suspended) }
             .compactMap(\.taskDescription))
         downloading = !activePaths.isEmpty
         if downloading { message = "다운로드 중 · 화면을 잠가도 이어집니다." }
