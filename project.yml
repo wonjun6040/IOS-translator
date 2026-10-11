@@ -1,0 +1,46 @@
+name: IOS-translator
+options:
+  deploymentTarget:
+    iOS: "18.0"
+  xcodeVersion: "26.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1"
+    SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: false
+packages:
+  SherpaOnnx:
+    url: https://github.com/k2-fsa/sherpa-onnx.git
+    exactVersion: "1.13.8"
+  LlamaSwift:
+    url: https://github.com/mattt/llama.swift.git
+    revision: 716419d4d7aa542fce301e809cde7234c68ddbc6
+targets:
+  IOSTranslator:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes:
+          - Info.plist
+      - path: LICENSE
+        buildPhase: resources
+      - path: NOTICE
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.wonjun6040.iostranslator
+        CODE_SIGN_STYLE: Automatic
+        INFOPLIST_FILE: App/Info.plist
+        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.0"
+    dependencies:
+      - package: SherpaOnnx
+        product: sherpa-onnx
+      - package: LlamaSwift
+        product: LlamaSwift
+schemes:
+  IOSTranslator:
+    build:
+      targets:
+        IOSTranslator: all
