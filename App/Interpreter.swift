@@ -91,6 +91,11 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         synthesizer.delegate = self
         synthesizer.usesApplicationAudioSession = true
         audio.onRouteChanged = { [weak self] in self?.refreshRoute() }
+        audio.onInputSourceChanged = { [weak self] in self?.refreshRoute() }
+        audio.onRoutingFallback = { [weak self] reason in self?.log("audio_routing_fallback", ["reason": reason]) }
+        audio.onInputSources = { [weak self] levels, selected in
+            self?.log("audio_input_sources", ["levels_dbfs": levels, "selected": selected])
+        }
         audio.onInputFormat = { [weak self] rate, channels, voiceProcessing in
             let session = AVAudioSession.sharedInstance()
             self?.log("audio_input_format", ["sample_rate": rate, "channels": channels,
@@ -103,6 +108,7 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
                 "io_buffer_seconds": session.ioBufferDuration,
                 "category_options": session.categoryOptions.rawValue,
                 "preferred_input": session.preferredInput?.portType.rawValue ?? "system",
+                "captured_inputs": self?.audio.capturedInputs ?? [],
                 "session_mode": session.mode.rawValue])
         }
         audio.onInputLevel = { [weak self] rms, peak, duration, nativeRMS, nativePeak in
@@ -244,6 +250,7 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
             var speech: [Float] = []
             while !Task.isCancelled, self.registrationID == operation, Date().timeIntervalSince(started) < 25 {
                 let segment = await self.detector.segment(self.audio.takeSamples())
+                self.audio.inputLocked = !segment.partial.isEmpty
                 for samples in segment.final { speech.append(contentsOf: samples) }
                 let available = speech.count + segment.partial.count
                 self.registrationProgress = min(1, Double(available) / 96_000)
@@ -293,6 +300,7 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
             let flush = !recording
             let segmentation = await detector.segment(audio.takeSamples(), flush: flush)
             guard sessionID == id else { return }
+            audio.inputLocked = !segmentation.partial.isEmpty
             if !segmentation.final.isEmpty {
                 log("vad_end", ["segments": segmentation.final.map { Double($0.count) / 16000 },
                     "flushed": flush])
@@ -504,6 +512,12 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
                         }
                         let speech = AVSpeechUtterance(string: result)
                         speech.voice = voice
+                        do { self.synthesizer.outputChannels = try self.audio.speechOutputChannels() }
+                        catch {
+                            self.message = "음성 출력 실패 · \(error.localizedDescription)"
+                            self.log("tts_error", ["turn": utterance.id.uuidString, "error": error.localizedDescription])
+                            continue
+                        }
                         self.spoken.insert(ObjectIdentifier(speech))
                         self.updateInputGate(speaking: true)
                         self.synthesizer.speak(speech)
@@ -531,13 +545,15 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         let session = AVAudioSession.sharedInstance()
         inputs = session.availableInputs ?? []
         actualInput = session.currentRoute.inputs.map(\.portName).joined(separator: ", ")
-        actualOutput = session.currentRoute.outputs.map(\.portName).joined(separator: ", ")
+        actualOutput = audio.playbackOutputs.map(\.portName).joined(separator: ", ")
         if actualInput.isEmpty { actualInput = "대기 중" }
         if actualOutput.isEmpty { actualOutput = "대기 중" }
         bluetoothConnected = inputs.contains { $0.portType == .bluetoothHFP }
             || session.currentRoute.outputs.contains { [.bluetoothHFP, .bluetoothA2DP, .bluetoothLE].contains($0.portType) }
         if session.currentRoute.inputs.isEmpty {
             microphoneMessage = "통역을 시작하면 마이크를 확인합니다."
+        } else if audio.hasDualInput {
+            microphoneMessage = "AirPods와 iPhone 마이크로 상대방 음성을 듣습니다."
         } else if audio.farFieldInputEnabled {
             microphoneMessage = "AirPods로 상대방 음성을 듣고 있습니다."
         } else if session.currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP }) {
@@ -547,22 +563,30 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         } else {
             microphoneMessage = "iPhone 마이크로 상대방 음성을 듣습니다."
         }
-        let headphoneOutput = session.currentRoute.outputs.allSatisfy {
+        let headphoneOutput = audio.playbackOutputs.allSatisfy {
             [.bluetoothHFP, .bluetoothA2DP, .bluetoothLE, .headphones].contains($0.portType)
-        } && !session.currentRoute.outputs.isEmpty
-        let phoneInput = !session.currentRoute.inputs.isEmpty
-            && session.currentRoute.inputs.allSatisfy { $0.portType == .builtInMic }
-        safeDuplex = headphoneOutput && (audio.farFieldInputEnabled || phoneInput)
-        let route = "\(actualInput)/\(actualOutput)/\(audio.farFieldInputEnabled)/\(audio.highQualityInputEnabled)"
+        } && !audio.playbackOutputs.isEmpty
+        safeDuplex = headphoneOutput && (audio.farFieldInputEnabled || audio.selectedInputIsPhone)
+        let route = "\(actualInput)/\(actualOutput)/\(audio.farFieldInputEnabled)/\(audio.highQualityInputEnabled)/\(audio.dualRouteEnabled)/\(audio.capturedInputs)/\(audio.selectedInputName)"
         if route != lastLoggedRoute {
             lastLoggedRoute = route
             log("audio_route", ["input": actualInput, "output": actualOutput,
                 "requested_input": microphoneUID.isEmpty ? "auto" : microphoneUID,
                 "far_field_supported": audio.farFieldInputSupported, "far_field_enabled": audio.farFieldInputEnabled,
                 "high_quality_enabled": audio.highQualityInputEnabled,
+                "dual_route": audio.dualRouteEnabled, "captured_inputs": audio.capturedInputs,
+                "selected_capture": audio.selectedInputName,
+                "hardware_outputs": session.currentRoute.outputs.map(\.portName),
                 "duplex": safeDuplex])
         }
-        if !spoken.isEmpty { updateInputGate(speaking: true) }
+        if !spoken.isEmpty {
+            do { synthesizer.outputChannels = try audio.speechOutputChannels() }
+            catch {
+                synthesizer.stopSpeaking(at: .immediate)
+                message = error.localizedDescription
+            }
+            updateInputGate(speaking: true)
+        }
     }
 
     func playReply(_ turn: TranslationTurn) {
@@ -576,6 +600,7 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         speakerUtteranceID = nil
         do {
             try audio.setSpeakerPlayback(true)
+            synthesizer.outputChannels = try audio.speechOutputChannels()
             let speech = AVSpeechUtterance(string: turn.translation)
             speech.voice = voice
             let id = ObjectIdentifier(speech)
@@ -634,6 +659,7 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
     private func updateInputGate(speaking: Bool) {
         gateTask?.cancel()
         if speaking {
+            audio.preferPhoneInput = speakerUtteranceID == nil && audio.hasDualInput
             audio.suppressInput = !safeDuplex
             inputPaused = recording && audio.suppressInput
             if audio.suppressInput { partial = "" }
@@ -642,6 +668,7 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
                 try? await Task.sleep(for: .milliseconds(350))
                 guard !Task.isCancelled, let self else { return }
                 self.audio.suppressInput = false
+                self.audio.preferPhoneInput = false
                 self.inputPaused = false
             }
         }
@@ -670,6 +697,8 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
                 speakerUtteranceID = nil
                 do { try audio.setSpeakerPlayback(false) }
                 catch { message = "AirPods 출력을 복구하지 못했습니다. \(error.localizedDescription)" }
+                do { synthesizer.outputChannels = try audio.speechOutputChannels() }
+                catch { message = error.localizedDescription }
             }
             if spoken.isEmpty { updateInputGate(speaking: false) }
         }
