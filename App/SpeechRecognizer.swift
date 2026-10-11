@@ -1,6 +1,34 @@
 import Foundation
 import SherpaOnnx
 import SherpaOnnxC
+import NaturalLanguage
+
+enum SpeechLanguages {
+    // Qwen3-ASR's 30 languages; Chinese regional dialects share the Chinese entry.
+    static let supported: [(code: String, name: String, label: String)] = [
+        ("ko", "Korean", "한국어"), ("en", "English", "English"), ("ja", "Japanese", "日本語"),
+        ("zh", "Chinese", "중국어"), ("yue", "Cantonese", "광둥어"), ("ar", "Arabic", "아랍어"),
+        ("de", "German", "독일어"), ("fr", "French", "프랑스어"), ("es", "Spanish", "스페인어"),
+        ("pt", "Portuguese", "포르투갈어"), ("id", "Indonesian", "인도네시아어"),
+        ("it", "Italian", "이탈리아어"), ("ru", "Russian", "러시아어"), ("th", "Thai", "태국어"),
+        ("vi", "Vietnamese", "베트남어"), ("tr", "Turkish", "튀르키예어"), ("hi", "Hindi", "힌디어"),
+        ("ms", "Malay", "말레이어"), ("nl", "Dutch", "네덜란드어"), ("sv", "Swedish", "스웨덴어"),
+        ("da", "Danish", "덴마크어"), ("fi", "Finnish", "핀란드어"), ("pl", "Polish", "폴란드어"),
+        ("cs", "Czech", "체코어"), ("fil", "Filipino", "필리핀어"), ("fa", "Persian", "페르시아어"),
+        ("el", "Greek", "그리스어"), ("hu", "Hungarian", "헝가리어"),
+        ("mk", "Macedonian", "마케도니아어"), ("ro", "Romanian", "루마니아어")
+    ]
+
+    static func code(for raw: String) -> String? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if value == "tagalog" || value == "tl" { return "fil" }
+        return supported.first { $0.code == value || $0.name.lowercased() == value }?.code
+    }
+
+    static func label(for code: String) -> String {
+        code == "auto" ? "자동 감지" : supported.first { $0.code == code }?.label ?? code
+    }
+}
 
 actor SpeechRecognizer {
     private var recognizer: OpaquePointer?
@@ -30,7 +58,7 @@ actor SpeechRecognizer {
         config.model_config.qwen3_asr.encoder = UnsafePointer(strings[1])
         config.model_config.qwen3_asr.decoder = UnsafePointer(strings[2])
         config.model_config.qwen3_asr.tokenizer = UnsafePointer(strings[3])
-        config.model_config.qwen3_asr.max_total_len = 512
+        config.model_config.qwen3_asr.max_total_len = 1024
         config.model_config.qwen3_asr.max_new_tokens = 256
         config.model_config.qwen3_asr.temperature = 0.000001
         config.model_config.qwen3_asr.top_p = 0.8
@@ -56,10 +84,21 @@ actor SpeechRecognizer {
             throw InterpreterError.message("음성을 인식하지 못했습니다.")
         }
         defer { SherpaOnnxDestroyOfflineRecognizerResult(result) }
-        let text = result.pointee.text.map { String(cString: $0) } ?? ""
+        let text = (result.pointee.text.map { String(cString: $0) } ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let raw = result.pointee.lang.map { String(cString: $0).lowercased() } ?? ""
-        let language = ["korean": "ko", "english": "en", "japanese": "ja"][raw] ?? raw
-        return (text.trimmingCharacters(in: .whitespacesAndNewlines), language.isEmpty ? nil : language)
+        var language = SpeechLanguages.code(for: raw)
+        // sherpa-onnx 1.13.8 strips Qwen's language prefix without filling result.lang.
+        // Identify the decoded text locally when that field is absent.
+        if language == nil, !text.isEmpty {
+            let identifier = NLLanguageRecognizer()
+            identifier.processString(text)
+            if let candidate = identifier.languageHypotheses(withMaximum: 1).first,
+               candidate.value >= 0.65 {
+                language = SpeechLanguages.code(for: candidate.key.rawValue)
+            }
+        }
+        return (text, language)
     }
 }
 
@@ -83,10 +122,10 @@ actor SpeechDetector {
         var config = SherpaOnnxVadModelConfig()
         config.silero_vad.model = UnsafePointer(path)
         config.silero_vad.threshold = 0.35
-        config.silero_vad.min_speech_duration = 0.1
-        config.silero_vad.min_silence_duration = 0.25
+        config.silero_vad.min_speech_duration = 0.15
+        config.silero_vad.min_silence_duration = 0.65
         config.silero_vad.window_size = 512
-        config.silero_vad.max_speech_duration = 4
+        config.silero_vad.max_speech_duration = 12
         config.sample_rate = 16000
         config.num_threads = 1
         config.provider = UnsafePointer(provider)
@@ -141,7 +180,7 @@ actor SpeechDetector {
             partial.removeAll()
             speaking = false
         }
-        return (finalized, Array(partial.suffix(64_000)))
+        return (finalized, Array(partial.suffix(192_000)))
     }
 
     private func takeSegments(_ detector: OpaquePointer) -> [[Float]] {

@@ -15,6 +15,7 @@ final class AudioCapture {
     private var observers: [NSObjectProtocol] = []
     private var rebuildTask: Task<Void, Never>?
     private(set) var running = false
+    private var speakerPlayback = false
 
     var farFieldInputEnabled: Bool {
         if #available(iOS 26.0, *) {
@@ -63,7 +64,8 @@ final class AudioCapture {
         try session.setCategory(.playAndRecord, mode: .default, options: options)
         try session.setActive(true)
         let inputs = session.availableInputs ?? []
-        let selected = inputs.first { $0.uid == microphoneUID }
+        let selected = inputs.first { speakerPlayback && $0.portType == .builtInMic }
+            ?? inputs.first { $0.uid == microphoneUID }
             ?? inputs.first { microphoneUID.isEmpty && $0.portType == .bluetoothHFP }
             ?? inputs.first { $0.portType == .builtInMic }
         try session.setPreferredInput(selected)
@@ -107,6 +109,12 @@ final class AudioCapture {
 
     func selectMicrophone(_ uid: String) throws {
         microphoneUID = uid
+        try configureSession()
+        if running { try rebuild() }
+    }
+
+    func setSpeakerPlayback(_ enabled: Bool) throws {
+        speakerPlayback = enabled
         try configureSession()
         if running { try rebuild() }
     }

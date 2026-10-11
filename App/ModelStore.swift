@@ -11,7 +11,7 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
         ("ASR/tokenizer/tokenizer_config.json", "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/68818b2313fe77bd06f6a7c5068ff3ef59d02b8a/tokenizer/tokenizer_config.json", 12_487),
         ("ASR/tokenizer/vocab.json", "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/68818b2313fe77bd06f6a7c5068ff3ef59d02b8a/tokenizer/vocab.json", 2_776_833),
         ("silero_vad.onnx", "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx", 643_854),
-        ("Qwen3-0.6B.Q4_K_M.gguf", "https://huggingface.co/QuantFactory/Qwen3-0.6B-GGUF/resolve/e7e05d713acaa2baccdfb52e967eaba8ba562ba8/Qwen3-0.6B.Q4_K_M.gguf", 484_220_000)
+        ("Hy-MT2-1.8B-Q4_K_M.gguf", "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/a0c709d9fac510f2c807aa3af52872340dc37a4a/Hy-MT2-1.8B-Q4_K_M.gguf", 1_133_080_448)
     ]
     nonisolated static var directory: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -19,12 +19,25 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
     }
     var downloading = false
     var progress: Double = 0
-    var message = "최초 모델 설치에 약 1.48 GB가 필요합니다."
+    var message = "최초 모델 설치에 약 2.12 GB가 필요합니다."
     var installed: Bool {
         Self.assets.allSatisfy { asset in
             let size = try? Self.directory.appendingPathComponent(asset.path).resourceValues(forKeys: [.fileSizeKey]).fileSize
             return Int64(size ?? 0) == asset.size
         }
+    }
+    var requiredDownloadBytes: Int64 {
+        Self.assets.reduce(0) { bytes, asset in
+            let size = try? Self.directory.appendingPathComponent(asset.path).resourceValues(forKeys: [.fileSizeKey]).fileSize
+            return bytes + (Int64(size ?? 0) == asset.size ? 0 : asset.size)
+        }
+    }
+    func removeReplacedTranslationModel() throws -> Int64 {
+        let oldModel = Self.directory.appendingPathComponent("Qwen3-0.6B.Q4_K_M.gguf")
+        guard FileManager.default.fileExists(atPath: oldModel.path) else { return 0 }
+        let size = try oldModel.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        try FileManager.default.removeItem(at: oldModel)
+        return Int64(size)
     }
     private var session: URLSession!
     private var waiter: CheckedContinuation<Void, Error>?
