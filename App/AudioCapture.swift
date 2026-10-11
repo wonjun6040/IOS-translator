@@ -24,6 +24,15 @@ final class AudioCapture {
     private(set) var running = false
     private var speakerPlayback = false
 
+    var highQualityInputEnabled: Bool {
+        if #available(iOS 26.0, *) {
+            return AVAudioSession.sharedInstance().currentRoute.inputs.contains {
+                $0.bluetoothMicrophoneExtension?.highQualityRecording.isEnabled == true
+            }
+        }
+        return false
+    }
+
     var farFieldInputEnabled: Bool {
         if #available(iOS 26.0, *) {
             return AVAudioSession.sharedInstance().currentRoute.inputs.contains {
@@ -79,7 +88,9 @@ final class AudioCapture {
             ?? inputs.first { $0.uid == microphoneUID }
             ?? inputs.first { microphoneUID.isEmpty && $0.portType == .bluetoothHFP }
             ?? inputs.first { $0.portType == .builtInMic }
-        try session.setPreferredInput(selected)
+        // Automatic far-field capture leaves input routing to iOS. Explicit
+        // microphone choices and speaker replies still select their input.
+        try session.setPreferredInput(microphoneUID.isEmpty && !speakerPlayback ? nil : selected)
         try session.overrideOutputAudioPort(.none)
         let route = session.currentRoute
         // Reply playback explicitly uses the phone speaker; microphone selection
@@ -132,10 +143,8 @@ final class AudioCapture {
 
     private func installEngine() throws {
         let candidate = AVAudioEngine()
-        // Preferred Bluetooth input can settle after engine construction. Enabling
-        // VoIP processing on the temporary built-in route also affects the later
-        // AirPods route, suppressing surrounding voices. Capture them unprocessed;
-        // supported AirPods supply their own far-field processing.
+        // Keep app-level VoIP processing off so it cannot suppress other people
+        // or music after the Bluetooth recording route has been negotiated.
         try attachTapAndStart(candidate)
         engine = candidate
         routeFingerprint = fingerprint()
@@ -229,7 +238,7 @@ final class AudioCapture {
     private func fingerprint() -> String {
         let session = AVAudioSession.sharedInstance()
         return (session.currentRoute.inputs + session.currentRoute.outputs).map { $0.uid }.joined(separator: "/")
-            + "/\(session.sampleRate)/\(farFieldInputEnabled)"
+            + "/\(session.sampleRate)/\(farFieldInputEnabled)/\(highQualityInputEnabled)"
     }
 
     private func routeChanged() {

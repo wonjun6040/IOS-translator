@@ -98,6 +98,11 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
                 "active_microphone_mode": AVCaptureDevice.activeMicrophoneMode.rawValue,
                 "preferred_microphone_mode": AVCaptureDevice.preferredMicrophoneMode.rawValue,
                 "input_gain": session.inputGain, "gain_settable": session.isInputGainSettable,
+                "input_latency_seconds": session.inputLatency,
+                "output_latency_seconds": session.outputLatency,
+                "io_buffer_seconds": session.ioBufferDuration,
+                "category_options": session.categoryOptions.rawValue,
+                "preferred_input": session.preferredInput?.portType.rawValue ?? "system",
                 "session_mode": session.mode.rawValue])
         }
         audio.onInputLevel = { [weak self] rms, peak, duration, nativeRMS, nativePeak in
@@ -548,12 +553,13 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         let phoneInput = !session.currentRoute.inputs.isEmpty
             && session.currentRoute.inputs.allSatisfy { $0.portType == .builtInMic }
         safeDuplex = headphoneOutput && (audio.farFieldInputEnabled || phoneInput)
-        let route = "\(actualInput)/\(actualOutput)/\(audio.farFieldInputEnabled)"
+        let route = "\(actualInput)/\(actualOutput)/\(audio.farFieldInputEnabled)/\(audio.highQualityInputEnabled)"
         if route != lastLoggedRoute {
             lastLoggedRoute = route
             log("audio_route", ["input": actualInput, "output": actualOutput,
                 "requested_input": microphoneUID.isEmpty ? "auto" : microphoneUID,
                 "far_field_supported": audio.farFieldInputSupported, "far_field_enabled": audio.farFieldInputEnabled,
+                "high_quality_enabled": audio.highQualityInputEnabled,
                 "duplex": safeDuplex])
         }
         if !spoken.isEmpty { updateInputGate(speaking: true) }
