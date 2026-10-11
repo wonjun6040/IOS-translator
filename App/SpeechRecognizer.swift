@@ -69,7 +69,7 @@ actor SpeechRecognizer {
         params.n_batch = 256
         params.n_ubatch = 256
         params.n_threads = 2
-        params.n_threads_batch = 2
+        params.n_threads_batch = 4
         params.offload_kqv = false
         params.op_offload = false
         params.abort_callback = { data in
@@ -83,7 +83,7 @@ actor SpeechRecognizer {
         }
         var audioParams = mtmd_context_params_default()
         audioParams.use_gpu = false
-        audioParams.n_threads = 2
+        audioParams.n_threads = 4
         audioParams.warmup = false
         guard let loadedEncoder = mtmd_init_from_file(
             directory.appendingPathComponent("Qwen3-ASR-1.7B.mmproj-Q8_0.gguf").path,
@@ -157,12 +157,42 @@ actor SpeechRecognizer {
         defer { llama_memory_clear(llama_get_memory(context), true) }
         let evaluationStarted = Date()
         var position: llama_pos = 0
-        let evaluation = mtmd_helper_eval_chunks(audioEncoder, context, chunks, 0, 0, 256, true, &position)
-        try Task.checkCancellation()
-        let decodingStarted = Date()
-        guard evaluation == 0 else {
-            throw InterpreterError.message("음성 인식 처리가 실패했습니다.")
+        var encodingSeconds = Double(0)
+        var prefillSeconds = Double(0)
+        var audioTokens = 0
+        let chunkCount = mtmd_input_chunks_size(chunks)
+        for index in 0..<chunkCount {
+            try Task.checkCancellation()
+            guard let chunk = mtmd_input_chunks_get(chunks, index) else {
+                throw InterpreterError.message("입력 음성을 처리하지 못했습니다.")
+            }
+            let status: Int32
+            if mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_AUDIO {
+                audioTokens += Int(mtmd_input_chunk_get_n_tokens(chunk))
+                let started = Date()
+                let encoded = mtmd_encode_chunk(audioEncoder, chunk)
+                encodingSeconds += Date().timeIntervalSince(started)
+                // Stop a superseded preview before its embeddings reach the LLM.
+                try Task.checkCancellation()
+                guard encoded == 0, let embeddings = mtmd_get_output_embd(audioEncoder) else {
+                    throw InterpreterError.message("음성 인코딩이 실패했습니다.")
+                }
+                let prefillStarted = Date()
+                status = mtmd_helper_decode_image_chunk(audioEncoder, context, chunk, embeddings,
+                    position, 0, 256, &position, nil, nil)
+                prefillSeconds += Date().timeIntervalSince(prefillStarted)
+            } else {
+                let started = Date()
+                status = mtmd_helper_eval_chunk_single(audioEncoder, context, chunk, position, 0,
+                    256, index == chunkCount - 1, &position)
+                prefillSeconds += Date().timeIntervalSince(started)
+            }
+            try Task.checkCancellation()
+            guard status == 0 else {
+                throw InterpreterError.message("음성 인식 처리가 실패했습니다.")
+            }
         }
+        let decodingStarted = Date()
         try Task.checkCancellation()
         guard let sampler = llama_sampler_init_greedy() else {
             throw InterpreterError.message("음성 인식 처리가 준비되지 않았습니다.")
@@ -223,6 +253,8 @@ actor SpeechRecognizer {
         }
         var timings = ["preparation_seconds": evaluationStarted.timeIntervalSince(preparationStarted),
             "audio_prefill_seconds": decodingStarted.timeIntervalSince(evaluationStarted),
+            "audio_encoding_seconds": encodingSeconds, "model_prefill_seconds": prefillSeconds,
+            "audio_tokens": Double(audioTokens), "prompt_positions": Double(mtmd_helper_get_n_pos(chunks)),
             "generation_seconds": Date().timeIntervalSince(decodingStarted), "output_tokens": Double(outputTokens)]
         if let firstTextAt { timings["first_text_seconds"] = firstTextAt.timeIntervalSince(preparationStarted) }
         if decoded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return ("", languageHint, timings) }

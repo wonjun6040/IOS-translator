@@ -165,6 +165,8 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
                 "device": UIDevice.current.model, "os": UIDevice.current.systemVersion,
                 "wearer": wearerSpeakerID ?? 0,
                 "exclude_wearer": excludeWearer,
+                "low_power": ProcessInfo.processInfo.isLowPowerModeEnabled,
+                "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
                 "asr_model": SpeechRecognizer.modelName, "translation_model": LocalTranslator.modelName])
             captureTask = Task { [weak self] in await self?.captureLoop(id: operation) }
         } catch { preparing = false; message = error.localizedDescription; audio.stop() }
@@ -305,7 +307,7 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         let interval = max(0.75, min(2, previewDuration * 1.25))
         guard !finalized.isEmpty || (recording && previewSamples.count >= 24_000
             && Date().timeIntervalSince(previewAt) >= interval) else { return }
-        recognitionTask = Task { [weak self] in
+        recognitionTask = Task(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             defer {
                 self.recognitionTask = nil
@@ -350,8 +352,10 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
                             if !final { self.partial = ""; self.liveTranslation = "" }
                             continue
                         }
+                        // An unregistered voice is still the selected partner language.
+                        // Only a positively identified wearer bypasses that selection.
                         let hint = self.sourceLanguage != "auto"
-                            && wearer == false ? self.sourceLanguage : nil
+                            && wearer != true ? self.sourceLanguage : nil
                         let decodeStarted = Date()
                         let displayID = UUID()
                         self.recognitionDisplayID = displayID
@@ -374,6 +378,8 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
                             "processing_seconds": Date().timeIntervalSince(decodeStarted),
                             "pipeline_seconds": duration, "speaker": part.speaker ?? 0,
                             "language_hint": hint ?? "auto", "pending_asr": self.finalized.count,
+                            "low_power": ProcessInfo.processInfo.isLowPowerModeEnabled,
+                            "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
                             "input_rms_dbfs": 20 * log10(max(rms, 0.000000001)), "input_peak": peak,
                             "timings": result.timings])
                         if final {
@@ -527,11 +533,14 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         let headphoneOutput = session.currentRoute.outputs.allSatisfy {
             [.bluetoothHFP, .bluetoothA2DP, .bluetoothLE, .headphones].contains($0.portType)
         } && !session.currentRoute.outputs.isEmpty
-        safeDuplex = headphoneOutput && audio.farFieldInputEnabled
+        let phoneInput = !session.currentRoute.inputs.isEmpty
+            && session.currentRoute.inputs.allSatisfy { $0.portType == .builtInMic }
+        safeDuplex = headphoneOutput && (audio.farFieldInputEnabled || phoneInput)
         let route = "\(actualInput)/\(actualOutput)/\(audio.farFieldInputEnabled)"
         if route != lastLoggedRoute {
             lastLoggedRoute = route
             log("audio_route", ["input": actualInput, "output": actualOutput,
+                "requested_input": microphoneUID.isEmpty ? "auto" : microphoneUID,
                 "far_field_supported": audio.farFieldInputSupported, "far_field_enabled": audio.farFieldInputEnabled,
                 "duplex": safeDuplex])
         }

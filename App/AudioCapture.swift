@@ -3,7 +3,7 @@ import AVFoundation
 
 @MainActor
 final class AudioCapture {
-    var microphoneUID = ""
+    private(set) var microphoneUID = ""
     var suppressInput = false
     var onRouteChanged: (() -> Void)?
     var onFailure: ((String) -> Void)?
@@ -59,8 +59,12 @@ final class AudioCapture {
 
     func configureSession() throws {
         let session = AVAudioSession.sharedInstance()
-        var options: AVAudioSession.CategoryOptions = [.allowBluetoothHFP, .allowBluetoothA2DP]
-        if #available(iOS 26.2, *) {
+        let useBuiltIn = speakerPlayback || microphoneUID == "builtin"
+        // HFP couples the Bluetooth microphone and output. A built-in selection
+        // must leave HFP/far-field capture, allowing AirPods to remain A2DP output.
+        var options: AVAudioSession.CategoryOptions = [.allowBluetoothA2DP]
+        if !useBuiltIn { options.insert(.allowBluetoothHFP) }
+        if #available(iOS 26.2, *), !useBuiltIn {
             // Public farFieldInput option (1 << 18); Xcode 26.1's SDK lacks its name.
             // https://developer.apple.com/documentation/avfaudio/avaudiosession/categoryoptions-swift.struct/farfieldinput
             options.insert(AVAudioSession.CategoryOptions(rawValue: 1 << 18))
@@ -68,16 +72,17 @@ final class AudioCapture {
         try session.setCategory(.playAndRecord, mode: .default, options: options)
         try session.setActive(true)
         let inputs = session.availableInputs ?? []
-        let selected = inputs.first { speakerPlayback && $0.portType == .builtInMic }
+        let selected = inputs.first { useBuiltIn && $0.portType == .builtInMic }
             ?? inputs.first { $0.uid == microphoneUID }
             ?? inputs.first { microphoneUID.isEmpty && $0.portType == .bluetoothHFP }
             ?? inputs.first { $0.portType == .builtInMic }
         try session.setPreferredInput(selected)
         try session.overrideOutputAudioPort(.none)
         let route = session.currentRoute
-        // Never force the speaker when headphones or Bluetooth are the active output.
-        if selected?.portType == .builtInMic,
-           route.outputs.allSatisfy({ $0.portType == .builtInReceiver || $0.portType == .builtInSpeaker }) {
+        // Reply playback explicitly uses the phone speaker; microphone selection
+        // alone keeps a connected headphone output.
+        if speakerPlayback || (selected?.portType == .builtInMic &&
+           route.outputs.allSatisfy({ $0.portType == .builtInReceiver || $0.portType == .builtInSpeaker })) {
             try session.overrideOutputAudioPort(.speaker)
         }
         onRouteChanged?()

@@ -229,8 +229,11 @@ struct TranslatorView: View {
                 Menu {
                     Picker("마이크", selection: $interpreter.microphoneUID) {
                         Text("자동").tag("")
-                        ForEach(interpreter.inputs, id: \.uid) { input in Text(input.portName).tag(input.uid) }
-                        if !interpreter.microphoneUID.isEmpty,
+                        Text("iPhone 마이크").tag("builtin")
+                        ForEach(interpreter.inputs.filter { $0.portType != .builtInMic }, id: \.uid) { input in
+                            Text(input.portName).tag(input.uid)
+                        }
+                        if !interpreter.microphoneUID.isEmpty, interpreter.microphoneUID != "builtin",
                            !interpreter.inputs.contains(where: { $0.uid == interpreter.microphoneUID }) {
                             Text("연결이 해제된 마이크").tag(interpreter.microphoneUID)
                         }
