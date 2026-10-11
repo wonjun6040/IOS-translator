@@ -2,6 +2,7 @@ import Foundation
 import SherpaOnnx
 import SherpaOnnxC
 import LlamaSwift
+import os
 
 enum SpeechLanguages {
     // Qwen3-ASR's 30 languages; Chinese regional dialects share the Chinese entry.
@@ -35,13 +36,22 @@ actor SpeechRecognizer {
     private var model: OpaquePointer?
     private var context: OpaquePointer?
     private var audioEncoder: OpaquePointer?
+    private nonisolated let cancellation = OSAllocatedUnfairLock(initialState: false)
+    private let abortFlag: UnsafeMutablePointer<OSAllocatedUnfairLock<Bool>>
 
-    init() { llama_backend_init() }
+    init() {
+        abortFlag = .allocate(capacity: 1)
+        // A copy shares the same allocated lock/state; C keeps this stable address.
+        abortFlag.initialize(to: cancellation)
+        llama_backend_init()
+    }
 
     deinit {
         if let audioEncoder { mtmd_free(audioEncoder) }
         if let context { llama_free(context) }
         if let model { llama_model_free(model) }
+        abortFlag.deinitialize(count: 1)
+        abortFlag.deallocate()
         // The backend is shared with translation and lives for the app process.
     }
 
@@ -62,6 +72,11 @@ actor SpeechRecognizer {
         params.n_threads_batch = 2
         params.offload_kqv = false
         params.op_offload = false
+        params.abort_callback = { data in
+            guard let data else { return false }
+            return data.assumingMemoryBound(to: OSAllocatedUnfairLock<Bool>.self).pointee.withLock { $0 }
+        }
+        params.abort_callback_data = UnsafeMutableRawPointer(abortFlag)
         guard let loadedContext = llama_init_from_model(loadedModel, params) else {
             llama_model_free(loadedModel)
             throw InterpreterError.message("음성 인식에 필요한 메모리를 확보하지 못했습니다.")
@@ -88,9 +103,24 @@ actor SpeechRecognizer {
         audioEncoder = loadedEncoder
     }
 
-    func transcribe(_ samples: [Float], languageHint: String? = nil) throws -> (text: String, language: String?) {
+    func transcribe(_ samples: [Float], languageHint: String? = nil,
+                   onPartial: @Sendable (String, String?) -> Void = { _, _ in }) async throws
+        -> (text: String, language: String?, timings: [String: Double]) {
         try Task.checkCancellation()
-        guard !samples.isEmpty else { return ("", nil) }
+        cancellation.withLock { $0 = false }
+        return try await withTaskCancellationHandler {
+            try decode(samples, languageHint: languageHint, onPartial: onPartial)
+        } onCancel: {
+            self.cancellation.withLock { $0 = true }
+        }
+    }
+
+    private func decode(_ samples: [Float], languageHint: String?,
+                        onPartial: @Sendable (String, String?) -> Void)
+        throws -> (text: String, language: String?, timings: [String: Double]) {
+        try Task.checkCancellation()
+        guard !samples.isEmpty else { return ("", nil, [:]) }
+        let preparationStarted = Date()
         guard let model, let context, let audioEncoder, let vocab = llama_model_get_vocab(model) else {
             throw InterpreterError.message("음성 인식이 준비되지 않았습니다.")
         }
@@ -125,8 +155,12 @@ actor SpeechRecognizer {
         }
         llama_memory_clear(llama_get_memory(context), true)
         defer { llama_memory_clear(llama_get_memory(context), true) }
+        let evaluationStarted = Date()
         var position: llama_pos = 0
-        guard mtmd_helper_eval_chunks(audioEncoder, context, chunks, 0, 0, 256, true, &position) == 0 else {
+        let evaluation = mtmd_helper_eval_chunks(audioEncoder, context, chunks, 0, 0, 256, true, &position)
+        try Task.checkCancellation()
+        let decodingStarted = Date()
+        guard evaluation == 0 else {
             throw InterpreterError.message("음성 인식 처리가 실패했습니다.")
         }
         try Task.checkCancellation()
@@ -138,6 +172,9 @@ actor SpeechRecognizer {
         defer { llama_batch_free(batch) }
         var bytes: [UInt8] = []
         var completed = false
+        var outputTokens = 0
+        var publishedAt = Date.distantPast
+        var firstTextAt: Date?
         for _ in 0..<outputLimit {
             try Task.checkCancellation()
             let token = llama_sampler_sample(sampler, context, -1)
@@ -154,13 +191,29 @@ actor SpeechRecognizer {
             }
             guard length >= 0 else { throw InterpreterError.message("음성 인식 결과를 읽지 못했습니다.") }
             bytes.append(contentsOf: piece.prefix(Int(length)).map { UInt8(bitPattern: $0) })
+            outputTokens += 1
+            if Date().timeIntervalSince(publishedAt) >= 0.12,
+               let decoded = String(bytes: bytes, encoding: .utf8) {
+                let output = prefix + decoded
+                if let marker = output.range(of: "<asr_text>") {
+                    let text = String(output[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let language = String(output[..<marker.lowerBound]).replacingOccurrences(of: "language ", with: "")
+                    if !text.isEmpty, !text.contains("<|") {
+                        if firstTextAt == nil { firstTextAt = Date() }
+                        onPartial(text, SpeechLanguages.code(for: language))
+                    }
+                }
+                publishedAt = Date()
+            }
             batch.n_tokens = 1
             batch.token[0] = token
             batch.pos[0] = position
             batch.n_seq_id[0] = 1
             batch.seq_id[0]![0] = 0
             batch.logits[0] = 1
-            guard llama_decode(context, batch) == 0 else {
+            let status = llama_decode(context, batch)
+            try Task.checkCancellation()
+            guard status == 0 else {
                 throw InterpreterError.message("음성 인식 처리가 실패했습니다.")
             }
             position += 1
@@ -168,7 +221,11 @@ actor SpeechRecognizer {
         guard completed, let decoded = String(bytes: bytes, encoding: .utf8) else {
             throw InterpreterError.message("음성 인식을 끝내지 못했습니다. 다시 말씀해 주세요.")
         }
-        if decoded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return ("", languageHint) }
+        var timings = ["preparation_seconds": evaluationStarted.timeIntervalSince(preparationStarted),
+            "audio_prefill_seconds": decodingStarted.timeIntervalSince(evaluationStarted),
+            "generation_seconds": Date().timeIntervalSince(decodingStarted), "output_tokens": Double(outputTokens)]
+        if let firstTextAt { timings["first_text_seconds"] = firstTextAt.timeIntervalSince(preparationStarted) }
+        if decoded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return ("", languageHint, timings) }
         let output = prefix + decoded
         guard let marker = output.range(of: "<asr_text>") else {
             throw InterpreterError.message("음성 인식 결과의 형식이 맞지 않습니다.")
@@ -177,7 +234,7 @@ actor SpeechRecognizer {
             .replacingOccurrences(of: "language ", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let text = String(output[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        return (text, SpeechLanguages.code(for: rawLanguage))
+        return (text, SpeechLanguages.code(for: rawLanguage), timings)
     }
 }
 

@@ -7,9 +7,14 @@ final class AudioCapture {
     var suppressInput = false
     var onRouteChanged: (() -> Void)?
     var onFailure: ((String) -> Void)?
+    var onInputFormat: ((Double, UInt32) -> Void)?
+    var onInputLevel: ((Double, Float, Double) -> Void)?
     private var engine: AVAudioEngine?
     private var pending: [Float] = []
     private var generation = UUID()
+    private var levelFrames = 0
+    private var levelEnergy = Double(0)
+    private var levelPeak = Float(0)
     private var routeFingerprint = ""
     private var observers: [NSObjectProtocol] = []
     private var rebuildTask: Task<Void, Never>?
@@ -132,12 +137,16 @@ final class AudioCapture {
     private func attachTapAndStart(_ candidate: AVAudioEngine) throws {
         let input = candidate.inputNode
         let format = input.outputFormat(forBus: 0)
+        onInputFormat?(format.sampleRate, format.channelCount)
         guard format.sampleRate > 0, format.channelCount > 0,
               let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
               let converter = AVAudioConverter(from: format, to: target) else {
             throw InterpreterError.message("현재 마이크의 오디오 형식을 사용할 수 없습니다.")
         }
         generation = UUID()
+        levelFrames = 0
+        levelEnergy = 0
+        levelPeak = 0
         let token = generation
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * 16000 / format.sampleRate) + 16)
@@ -154,6 +163,20 @@ final class AudioCapture {
             let samples = Array(UnsafeBufferPointer(start: data, count: Int(output.frameLength)))
             Task { @MainActor in
                 guard let self, self.running, self.generation == token else { return }
+                // Measure actual input before playback gating or VAD. No audio is saved.
+                self.levelFrames += samples.count
+                for sample in samples {
+                    self.levelEnergy += Double(sample) * Double(sample)
+                    self.levelPeak = max(self.levelPeak, abs(sample))
+                }
+                if self.levelFrames >= 32_000 {
+                    let rms = sqrt(self.levelEnergy / Double(self.levelFrames))
+                    self.onInputLevel?(20 * log10(max(rms, 0.000000001)), self.levelPeak,
+                        Double(self.levelFrames) / 16_000)
+                    self.levelFrames = 0
+                    self.levelEnergy = 0
+                    self.levelPeak = 0
+                }
                 self.pending.append(contentsOf: self.suppressInput ? [Float](repeating: 0, count: samples.count) : samples)
                 if self.pending.count > 960_000 {
                     self.onFailure?("처리가 입력 속도를 따라가지 못했습니다. 통역을 중지합니다.")
