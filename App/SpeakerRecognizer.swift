@@ -134,29 +134,30 @@ actor SpeakerRecognizer {
             let identity = identities[segments[0].speaker]
             return [SpeakerAudio(samples: samples, speaker: identity?.id, similarity: identity?.score)]
         }
-        var output: [SpeakerAudio] = []
-        for segment in segments {
-            let start = max(0, min(samples.count, Int(segment.start * 16_000)))
-            let end = max(start, min(samples.count, Int(segment.end * 16_000)))
-            // Diarization labels time ranges; it cannot unmix simultaneous voices.
-            // Cut out overlapping ranges rather than attribute their mixture.
-            var ranges = [start..<end]
-            for other in segments where other.speaker != segment.speaker {
-                let low = max(0, Int(other.start * 16_000))
-                let high = min(samples.count, Int(other.end * 16_000))
-                ranges = ranges.flatMap { range -> [Range<Int>] in
-                    guard low < range.upperBound, high > range.lowerBound else { return [range] }
-                    var remaining: [Range<Int>] = []
-                    if range.lowerBound < low { remaining.append(range.lowerBound..<low) }
-                    if high < range.upperBound { remaining.append(high..<range.upperBound) }
-                    return remaining
-                }
+        // Overlapping labels cannot be separated without losing words. Keep
+        // the complete utterance and leave its identity unknown in that case.
+        let overlap = segments.contains { segment in
+            segments.contains { other in
+                other.speaker != segment.speaker
+                    && min(segment.end, other.end) - max(segment.start, other.start) > 0
             }
+        }
+        if overlap {
+            return [SpeakerAudio(samples: samples, speaker: nil, similarity: nil)]
+        }
+        var output: [SpeakerAudio] = []
+        var start = 0
+        for (index, segment) in segments.enumerated() {
+            // Assign the gap halfway between speakers; retain every input sample
+            // including the beginning and end that the diarizer may have trimmed.
+            let end = index == segments.count - 1 ? samples.count
+                : max(start, min(samples.count, Int((segment.end + segments[index + 1].start) * 8_000)))
             let identity = identities[segment.speaker]
-            for range in ranges where range.count >= 6_400 {
-                output.append(SpeakerAudio(samples: Array(samples[range]),
+            if end > start {
+                output.append(SpeakerAudio(samples: Array(samples[start..<end]),
                     speaker: identity?.id, similarity: identity?.score))
             }
+            start = end
         }
         try Task.checkCancellation()
         return output
