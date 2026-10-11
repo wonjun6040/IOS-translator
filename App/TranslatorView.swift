@@ -10,7 +10,7 @@ struct TranslatorView: View {
         NavigationStack {
             VStack(spacing: 20) {
                 HStack(spacing: 20) {
-                    languageMenu("입력 언어", selection: $interpreter.sourceLanguage)
+                    languageMenu("상대방 언어", selection: $interpreter.sourceLanguage)
                     Button {
                         let source = interpreter.sourceLanguage
                         interpreter.sourceLanguage = interpreter.targetLanguage
@@ -18,15 +18,15 @@ struct TranslatorView: View {
                     } label: { Image(systemName: "arrow.left.arrow.right") }
                         .accessibilityLabel("언어 바꾸기")
                         .disabled(busy)
-                    languageMenu("출력 언어", selection: $interpreter.targetLanguage)
+                    languageMenu("내가 들을 언어", selection: $interpreter.targetLanguage)
                 }
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack(spacing: 16) {
                             textCard(language: interpreter.sourceLanguage, text: interpreter.confirmed,
-                                partial: interpreter.partial, placeholder: interpreter.recording ? "듣고 있습니다…" : "마이크를 눌러 말해 주세요", translated: false)
+                                partial: interpreter.partial, placeholder: interpreter.recording ? "듣고 있습니다…" : "시작하면 상대방의 말을 듣습니다", translated: false)
                             textCard(language: interpreter.targetLanguage, text: interpreter.translated,
-                                partial: "", placeholder: interpreter.translating ? "번역 중…" : "번역이 여기에 표시됩니다", translated: true)
+                                partial: interpreter.liveTranslation, placeholder: interpreter.translating ? "번역 중…" : "번역이 여기에 표시됩니다", translated: true)
                             Color.clear.frame(height: 1).id("bottom")
                         }
                     }
@@ -142,9 +142,9 @@ struct TranslatorView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Menu {
-                    Text("HFP 입력·출력은 iOS가 함께 라우팅합니다. iPhone 마이크를 선택하면 출력도 바뀔 수 있습니다.")
+                    Text("상대방 음성 수집을 지원하는 AirPods를 우선 사용합니다.")
                     Picker("마이크", selection: $interpreter.microphoneUID) {
-                        Text("자동 · Bluetooth 우선").tag("")
+                        Text("자동 · AirPods 상대방 음성").tag("")
                         ForEach(interpreter.inputs, id: \.uid) { input in Text(input.portName).tag(input.uid) }
                         if !interpreter.microphoneUID.isEmpty,
                            !interpreter.inputs.contains(where: { $0.uid == interpreter.microphoneUID }) {
@@ -152,7 +152,7 @@ struct TranslatorView: View {
                         }
                     }
                 } label: { Label(interpreter.actualInput, systemImage: "mic").lineLimit(1) }
-                    .disabled(interpreter.preparing || interpreter.stopping)
+                    .disabled(busy)
                 Spacer()
                 Label(interpreter.bluetoothConnected ? "Bluetooth 연결됨" : "iPhone",
                     systemImage: interpreter.bluetoothConnected ? "airpods" : "iphone")
@@ -160,6 +160,7 @@ struct TranslatorView: View {
             }
             Label("출력 · \(interpreter.actualOutput)", systemImage: "speaker.wave.2")
                 .foregroundStyle(.secondary)
+            Text(interpreter.microphoneMessage).foregroundStyle(.secondary)
             if interpreter.recording {
                 Text(interpreter.duplexMessage).foregroundStyle(.secondary)
             }

@@ -43,7 +43,8 @@ actor LocalTranslator {
         context = loadedContext
     }
 
-    func translate(text: String, sourceLanguageCode: String, targetLanguageCode: String) throws -> String {
+    func translate(text: String, sourceLanguageCode: String, targetLanguageCode: String,
+                   onPartial: @Sendable (String) -> Void = { _ in }) throws -> String {
         let names = ["ko": "Korean", "en": "English", "ja": "Japanese"]
         guard let source = names[sourceLanguageCode], let target = names[targetLanguageCode],
               source != target, let model, let context, let vocab = llama_model_get_vocab(model) else {
@@ -93,6 +94,7 @@ actor LocalTranslator {
         defer { llama_sampler_free(sampler) }
         var bytes: [UInt8] = []
         var completed = false
+        var publishedAt = Date.distantPast
         for step in 0..<outputLimit {
             try Task.checkCancellation()
             let token = llama_sampler_sample(sampler, context, -1)
@@ -112,6 +114,12 @@ actor LocalTranslator {
             }
             guard length >= 0 else { throw failure("번역 결과를 읽지 못했습니다.") }
             bytes.append(contentsOf: piece.prefix(Int(length)).map { UInt8(bitPattern: $0) })
+            if Date().timeIntervalSince(publishedAt) >= 0.12,
+               let text = String(bytes: bytes, encoding: .utf8),
+               !text.contains("<think>"), !text.contains("<|") {
+                onPartial(text.trimmingCharacters(in: .whitespacesAndNewlines))
+                publishedAt = Date()
+            }
             batch.n_tokens = 1
             batch.token[0] = token
             batch.pos[0] = count + Int32(step)

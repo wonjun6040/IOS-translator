@@ -16,6 +16,24 @@ final class AudioCapture {
     private var rebuildTask: Task<Void, Never>?
     private(set) var running = false
 
+    var farFieldInputEnabled: Bool {
+        if #available(iOS 26.0, *) {
+            return AVAudioSession.sharedInstance().currentRoute.inputs.contains {
+                $0.bluetoothMicrophoneExtension?.farFieldCapture.isEnabled == true
+            }
+        }
+        return false
+    }
+
+    var farFieldInputSupported: Bool {
+        if #available(iOS 26.0, *) {
+            return AVAudioSession.sharedInstance().currentRoute.inputs.contains {
+                $0.bluetoothMicrophoneExtension?.farFieldCapture.isSupported == true
+            }
+        }
+        return false
+    }
+
     init() {
         let center = NotificationCenter.default
         for name in [AVAudioSession.routeChangeNotification, Notification.Name.AVAudioEngineConfigurationChange] {
@@ -36,7 +54,13 @@ final class AudioCapture {
 
     func configureSession() throws {
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP, .allowBluetoothA2DP])
+        var options: AVAudioSession.CategoryOptions = [.allowBluetoothHFP, .allowBluetoothA2DP]
+        if #available(iOS 26.2, *) {
+            // Public farFieldInput option (1 << 18); Xcode 26.1's SDK lacks its name.
+            // https://developer.apple.com/documentation/avfaudio/avaudiosession/categoryoptions-swift.struct/farfieldinput
+            options.insert(AVAudioSession.CategoryOptions(rawValue: 1 << 18))
+        }
+        try session.setCategory(.playAndRecord, mode: .default, options: options)
         try session.setActive(true)
         let inputs = session.availableInputs ?? []
         let selected = inputs.first { $0.uid == microphoneUID }
@@ -89,6 +113,16 @@ final class AudioCapture {
 
     private func installEngine() throws {
         let candidate = AVAudioEngine()
+        // VoIP processing targets the wearer's voice. Let the Bluetooth device's
+        // far-field capture process surrounding speech instead.
+        if AVAudioSession.sharedInstance().currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP }) {
+            try attachTapAndStart(candidate)
+            voiceProcessing = false
+            engine = candidate
+            routeFingerprint = fingerprint()
+            onRouteChanged?()
+            return
+        }
         do {
             try candidate.inputNode.setVoiceProcessingEnabled(true)
             try attachTapAndStart(candidate)
@@ -144,7 +178,7 @@ final class AudioCapture {
     private func fingerprint() -> String {
         let session = AVAudioSession.sharedInstance()
         return (session.currentRoute.inputs + session.currentRoute.outputs).map { $0.uid }.joined(separator: "/")
-            + "/\(session.sampleRate)"
+            + "/\(session.sampleRate)/\(farFieldInputEnabled)"
     }
 
     private func routeChanged() {

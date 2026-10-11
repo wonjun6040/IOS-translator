@@ -4,15 +4,9 @@ import SherpaOnnxC
 
 actor SpeechRecognizer {
     private var recognizer: OpaquePointer?
-    private var detector: OpaquePointer?
-    private var remainder: [Float] = []
-    private var recent: [Float] = []
-    private var partial: [Float] = []
-    private var speaking = false
 
     deinit {
         if let recognizer { SherpaOnnxDestroyOfflineRecognizer(recognizer) }
-        if let detector { SherpaOnnxDestroyVoiceActivityDetector(detector) }
     }
 
     func load() throws {
@@ -23,15 +17,15 @@ actor SpeechRecognizer {
                      directory.appendingPathComponent("ASR/encoder.int8.onnx").path,
                      directory.appendingPathComponent("ASR/decoder.int8.onnx").path,
                      directory.appendingPathComponent("ASR/tokenizer").path,
-                     directory.appendingPathComponent("silero_vad.onnx").path, "cpu", "", "greedy_search"]
+                     "cpu", "", "greedy_search"]
         let strings = paths.map { strdup($0)! }
         defer { strings.forEach { free($0) } }
         var config = SherpaOnnxOfflineRecognizerConfig()
         config.feat_config.sample_rate = 16000
         config.feat_config.feature_dim = 80
         config.model_config.num_threads = 2
-        config.model_config.provider = UnsafePointer(strings[5])
-        config.model_config.tokens = UnsafePointer(strings[6])
+        config.model_config.provider = UnsafePointer(strings[4])
+        config.model_config.tokens = UnsafePointer(strings[5])
         config.model_config.qwen3_asr.conv_frontend = UnsafePointer(strings[0])
         config.model_config.qwen3_asr.encoder = UnsafePointer(strings[1])
         config.model_config.qwen3_asr.decoder = UnsafePointer(strings[2])
@@ -41,27 +35,65 @@ actor SpeechRecognizer {
         config.model_config.qwen3_asr.temperature = 0.000001
         config.model_config.qwen3_asr.top_p = 0.8
         config.model_config.qwen3_asr.seed = 42
-        config.model_config.qwen3_asr.hotwords = UnsafePointer(strings[6])
-        config.decoding_method = UnsafePointer(strings[7])
+        config.model_config.qwen3_asr.hotwords = UnsafePointer(strings[5])
+        config.decoding_method = UnsafePointer(strings[6])
         guard let loaded = SherpaOnnxCreateOfflineRecognizer(&config) else {
             throw InterpreterError.message("Qwen 음성 인식 모델을 불러오지 못했습니다.")
         }
-        var vadConfig = SherpaOnnxVadModelConfig()
-        vadConfig.silero_vad.model = UnsafePointer(strings[4])
-        vadConfig.silero_vad.threshold = 0.5
-        vadConfig.silero_vad.min_speech_duration = 0.1
-        vadConfig.silero_vad.min_silence_duration = 0.45
-        vadConfig.silero_vad.window_size = 512
-        vadConfig.silero_vad.max_speech_duration = 12
-        vadConfig.sample_rate = 16000
-        vadConfig.num_threads = 1
-        vadConfig.provider = UnsafePointer(strings[5])
-        guard let vad = SherpaOnnxCreateVoiceActivityDetector(&vadConfig, 30) else {
-            SherpaOnnxDestroyOfflineRecognizer(loaded)
+        recognizer = loaded
+    }
+
+    func transcribe(_ samples: [Float]) throws -> (text: String, language: String?) {
+        try Task.checkCancellation()
+        guard let recognizer, let stream = SherpaOnnxCreateOfflineStream(recognizer) else {
+            throw InterpreterError.message("음성 인식이 준비되지 않았습니다.")
+        }
+        defer { SherpaOnnxDestroyOfflineStream(stream) }
+        samples.withUnsafeBufferPointer { SherpaOnnxAcceptWaveformOffline(stream, 16000, $0.baseAddress, Int32($0.count)) }
+        SherpaOnnxDecodeOfflineStream(recognizer, stream)
+        try Task.checkCancellation()
+        guard let result = SherpaOnnxGetOfflineStreamResult(stream) else {
+            throw InterpreterError.message("음성을 인식하지 못했습니다.")
+        }
+        defer { SherpaOnnxDestroyOfflineRecognizerResult(result) }
+        let text = result.pointee.text.map { String(cString: $0) } ?? ""
+        let raw = result.pointee.lang.map { String(cString: $0).lowercased() } ?? ""
+        let language = ["korean": "ko", "english": "en", "japanese": "ja"][raw] ?? raw
+        return (text.trimmingCharacters(in: .whitespacesAndNewlines), language.isEmpty ? nil : language)
+    }
+}
+
+/// VAD continues consuming microphone frames while Qwen is decoding a previous chunk.
+actor SpeechDetector {
+    private var detector: OpaquePointer?
+    private var remainder: [Float] = []
+    private var recent: [Float] = []
+    private var partial: [Float] = []
+    private var speaking = false
+
+    deinit {
+        if let detector { SherpaOnnxDestroyVoiceActivityDetector(detector) }
+    }
+
+    func load() throws {
+        guard detector == nil else { return }
+        let path = strdup(ModelStore.directory.appendingPathComponent("silero_vad.onnx").path)!
+        let provider = strdup("cpu")!
+        defer { free(path); free(provider) }
+        var config = SherpaOnnxVadModelConfig()
+        config.silero_vad.model = UnsafePointer(path)
+        config.silero_vad.threshold = 0.35
+        config.silero_vad.min_speech_duration = 0.1
+        config.silero_vad.min_silence_duration = 0.25
+        config.silero_vad.window_size = 512
+        config.silero_vad.max_speech_duration = 4
+        config.sample_rate = 16000
+        config.num_threads = 1
+        config.provider = UnsafePointer(provider)
+        guard let loaded = SherpaOnnxCreateVoiceActivityDetector(&config, 30) else {
             throw InterpreterError.message("Silero 발화 감지 모델을 불러오지 못했습니다.")
         }
-        recognizer = loaded
-        detector = vad
+        detector = loaded
     }
 
     func reset() {
@@ -109,8 +141,7 @@ actor SpeechRecognizer {
             partial.removeAll()
             speaking = false
         }
-        // Partial text is display-only and never enters the translation queue.
-        return (finalized, Array(partial.suffix(192_000)))
+        return (finalized, Array(partial.suffix(64_000)))
     }
 
     private func takeSegments(_ detector: OpaquePointer) -> [[Float]] {
@@ -127,22 +158,4 @@ actor SpeechRecognizer {
         return segments
     }
 
-    func transcribe(_ samples: [Float]) throws -> (text: String, language: String?) {
-        try Task.checkCancellation()
-        guard let recognizer, let stream = SherpaOnnxCreateOfflineStream(recognizer) else {
-            throw InterpreterError.message("음성 인식이 준비되지 않았습니다.")
-        }
-        defer { SherpaOnnxDestroyOfflineStream(stream) }
-        samples.withUnsafeBufferPointer { SherpaOnnxAcceptWaveformOffline(stream, 16000, $0.baseAddress, Int32($0.count)) }
-        SherpaOnnxDecodeOfflineStream(recognizer, stream)
-        try Task.checkCancellation()
-        guard let result = SherpaOnnxGetOfflineStreamResult(stream) else {
-            throw InterpreterError.message("음성을 인식하지 못했습니다.")
-        }
-        defer { SherpaOnnxDestroyOfflineRecognizerResult(result) }
-        let text = result.pointee.text.map { String(cString: $0) } ?? ""
-        let raw = result.pointee.lang.map { String(cString: $0).lowercased() } ?? ""
-        let language = ["korean": "ko", "english": "en", "japanese": "ja"][raw] ?? raw
-        return (text.trimmingCharacters(in: .whitespacesAndNewlines), language.isEmpty ? nil : language)
-    }
 }
