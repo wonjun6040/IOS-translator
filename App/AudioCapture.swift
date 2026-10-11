@@ -7,14 +7,17 @@ final class AudioCapture {
     var suppressInput = false
     var onRouteChanged: (() -> Void)?
     var onFailure: ((String) -> Void)?
-    var onInputFormat: ((Double, UInt32) -> Void)?
-    var onInputLevel: ((Double, Float, Double) -> Void)?
+    var onInputFormat: ((Double, UInt32, Bool) -> Void)?
+    var onInputLevel: ((Double, Float, Double, Double?, Float?) -> Void)?
     private var engine: AVAudioEngine?
     private var pending: [Float] = []
     private var generation = UUID()
     private var levelFrames = 0
     private var levelEnergy = Double(0)
     private var levelPeak = Float(0)
+    private var nativeLevelSamples = 0
+    private var nativeLevelEnergy = Double(0)
+    private var nativeLevelPeak = Float(0)
     private var routeFingerprint = ""
     private var observers: [NSObjectProtocol] = []
     private var rebuildTask: Task<Void, Never>?
@@ -142,7 +145,7 @@ final class AudioCapture {
     private func attachTapAndStart(_ candidate: AVAudioEngine) throws {
         let input = candidate.inputNode
         let format = input.outputFormat(forBus: 0)
-        onInputFormat?(format.sampleRate, format.channelCount)
+        onInputFormat?(format.sampleRate, format.channelCount, input.isVoiceProcessingEnabled)
         guard format.sampleRate > 0, format.channelCount > 0,
               let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
               let converter = AVAudioConverter(from: format, to: target) else {
@@ -152,8 +155,30 @@ final class AudioCapture {
         levelFrames = 0
         levelEnergy = 0
         levelPeak = 0
+        nativeLevelSamples = 0
+        nativeLevelEnergy = 0
+        nativeLevelPeak = 0
         let token = generation
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            // Compare the hardware stream with the resampled stream without
+            // retaining microphone audio. An input DSP issue must not be hidden
+            // by measuring only the converter's output.
+            var nativeCount = 0
+            var nativeEnergy = Double(0)
+            var nativePeak = Float(0)
+            if format.commonFormat == .pcmFormatFloat32, let planes = buffer.floatChannelData {
+                let planeCount = format.isInterleaved ? 1 : Int(format.channelCount)
+                let planeSamples = Int(buffer.frameLength) * (format.isInterleaved ? Int(format.channelCount) : 1)
+                for channel in 0..<planeCount {
+                    for index in 0..<planeSamples {
+                        let sample = planes[channel][index]
+                        nativeEnergy += Double(sample) * Double(sample)
+                        nativePeak = max(nativePeak, abs(sample))
+                    }
+                }
+                nativeCount = planeCount * planeSamples
+            }
+            let nativeMeasurement = (nativeCount, nativeEnergy, nativePeak)
             let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * 16000 / format.sampleRate) + 16)
             guard let output = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
             var supplied = false
@@ -170,6 +195,9 @@ final class AudioCapture {
                 guard let self, self.running, self.generation == token else { return }
                 // Measure actual input before playback gating or VAD. No audio is saved.
                 self.levelFrames += samples.count
+                self.nativeLevelSamples += nativeMeasurement.0
+                self.nativeLevelEnergy += nativeMeasurement.1
+                self.nativeLevelPeak = max(self.nativeLevelPeak, nativeMeasurement.2)
                 for sample in samples {
                     self.levelEnergy += Double(sample) * Double(sample)
                     self.levelPeak = max(self.levelPeak, abs(sample))
@@ -177,10 +205,16 @@ final class AudioCapture {
                 if self.levelFrames >= 32_000 {
                     let rms = sqrt(self.levelEnergy / Double(self.levelFrames))
                     self.onInputLevel?(20 * log10(max(rms, 0.000000001)), self.levelPeak,
-                        Double(self.levelFrames) / 16_000)
+                        Double(self.levelFrames) / 16_000,
+                        self.nativeLevelSamples > 0
+                            ? 20 * log10(max(sqrt(self.nativeLevelEnergy / Double(self.nativeLevelSamples)), 0.000000001)) : nil,
+                        self.nativeLevelSamples > 0 ? self.nativeLevelPeak : nil)
                     self.levelFrames = 0
                     self.levelEnergy = 0
                     self.levelPeak = 0
+                    self.nativeLevelSamples = 0
+                    self.nativeLevelEnergy = 0
+                    self.nativeLevelPeak = 0
                 }
                 self.pending.append(contentsOf: self.suppressInput ? [Float](repeating: 0, count: samples.count) : samples)
                 if self.pending.count > 960_000 {

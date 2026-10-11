@@ -91,13 +91,25 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         synthesizer.delegate = self
         synthesizer.usesApplicationAudioSession = true
         audio.onRouteChanged = { [weak self] in self?.refreshRoute() }
-        audio.onInputFormat = { [weak self] rate, channels in
-            self?.log("audio_input_format", ["sample_rate": rate, "channels": channels])
+        audio.onInputFormat = { [weak self] rate, channels, voiceProcessing in
+            let session = AVAudioSession.sharedInstance()
+            self?.log("audio_input_format", ["sample_rate": rate, "channels": channels,
+                "voice_processing": voiceProcessing,
+                "active_microphone_mode": AVCaptureDevice.activeMicrophoneMode.rawValue,
+                "preferred_microphone_mode": AVCaptureDevice.preferredMicrophoneMode.rawValue,
+                "input_gain": session.inputGain, "gain_settable": session.isInputGainSettable,
+                "session_mode": session.mode.rawValue])
         }
-        audio.onInputLevel = { [weak self] rms, peak, duration in
+        audio.onInputLevel = { [weak self] rms, peak, duration, nativeRMS, nativePeak in
             guard let self else { return }
-            self.log("audio_input_level", ["rms_dbfs": rms, "peak": peak,
-                "audio_seconds": duration, "input": self.actualInput, "suppressed": self.audio.suppressInput])
+            var values: [String: Any] = ["rms_dbfs": rms, "peak": peak,
+                "audio_seconds": duration, "input": self.actualInput, "suppressed": self.audio.suppressInput,
+                "active_microphone_mode": AVCaptureDevice.activeMicrophoneMode.rawValue]
+            if let nativeRMS, let nativePeak {
+                values["native_rms_dbfs"] = nativeRMS
+                values["native_peak"] = nativePeak
+            }
+            self.log("audio_input_level", values)
         }
         audio.onFailure = { [weak self] text in
             guard let self else { return }
