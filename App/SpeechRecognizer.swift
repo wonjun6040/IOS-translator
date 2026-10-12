@@ -80,6 +80,7 @@ actor SpeechRecognizer {
         let options = DecodingOptions(verbose: false, task: .transcribe, language: hint,
             temperatureFallbackCount: 0, sampleLength: 256, usePrefillPrompt: true,
             detectLanguage: hint == nil, skipSpecialTokens: true, withoutTimestamps: true,
+            windowClipTime: 0,
             // A low-confidence first token prematurely rejected the saved recordings.
             // Silero gates speech; evaluate confidence over the full decoded segment.
             firstTokenLogProbThreshold: nil, concurrentWorkerCount: 1)
@@ -110,8 +111,11 @@ actor SpeechRecognizer {
         if let segment = results.first?.segments.first {
             timings["average_log_probability"] = Double(segment.avgLogprob)
         }
-        if let first = results.first, first.timings.firstTokenTime > first.timings.pipelineStart {
-            timings["first_decoder_prediction_seconds"] = first.timings.firstTokenTime - first.timings.pipelineStart
+        if let first = results.first {
+            let elapsed = first.timings.firstTokenTime - first.timings.pipelineStart
+            if elapsed.isFinite, elapsed > 0, elapsed <= Date().timeIntervalSince(started) {
+                timings["first_decoder_prediction_seconds"] = elapsed
+            }
         }
         return (text, language, timings)
     }
@@ -138,13 +142,13 @@ actor SpeechDetector {
         config.silero_vad.model = UnsafePointer(path)
         config.silero_vad.threshold = 0.30
         config.silero_vad.min_speech_duration = 0.10
-        config.silero_vad.min_silence_duration = 0.90
+        config.silero_vad.min_silence_duration = 1.50
         config.silero_vad.window_size = 512
-        config.silero_vad.max_speech_duration = 12
+        config.silero_vad.max_speech_duration = 60
         config.sample_rate = 16000
         config.num_threads = 1
         config.provider = UnsafePointer(provider)
-        guard let loaded = SherpaOnnxCreateVoiceActivityDetector(&config, 30) else {
+        guard let loaded = SherpaOnnxCreateVoiceActivityDetector(&config, 90) else {
             throw InterpreterError.message("Silero 발화 감지 모델을 불러오지 못했습니다.")
         }
         detector = loaded
@@ -158,7 +162,8 @@ actor SpeechDetector {
         speaking = false
     }
 
-    /// Each 512-sample frame is accepted once. Completed VAD segments are consumed once.
+    /// VAD supplies endpoints only. Keep every original frame between them,
+    /// including quiet syllables and pauses; never use its cropped audio for ASR.
     func segment(_ samples: [Float], flush: Bool = false) -> (final: [[Float]], partial: [Float]) {
         guard let detector else { return ([], []) }
         remainder.append(contentsOf: samples)
@@ -168,48 +173,56 @@ actor SpeechDetector {
             let frame = Array(remainder[cursor..<cursor + 512])
             cursor += 512
             recent.append(contentsOf: frame)
-            if recent.count > 3200 { recent.removeFirst(recent.count - 3200) }
-            frame.withUnsafeBufferPointer { SherpaOnnxVoiceActivityDetectorAcceptWaveform(detector, $0.baseAddress, 512) }
+            if recent.count > 8000 { recent.removeFirst(recent.count - 8000) }
+            accept(frame, detector: detector)
             let detected = SherpaOnnxVoiceActivityDetectorDetected(detector) != 0
             if detected && !speaking {
                 partial = recent
                 speaking = true
             } else if speaking { partial.append(contentsOf: frame) }
-            let completed = takeSegments(detector)
-            if !completed.isEmpty {
-                finalized += completed
-                speaking = detected
-                partial = detected ? recent : []
+            if consumeEndpoints(detector), speaking {
+                finalized.append(partial)
+                speaking = false
+                partial.removeAll(keepingCapacity: true)
             }
         }
         if cursor > 0 { remainder.removeFirst(cursor) }
         if flush {
             if !remainder.isEmpty {
-                remainder.withUnsafeBufferPointer {
-                    SherpaOnnxVoiceActivityDetectorAcceptWaveform(detector, $0.baseAddress, Int32($0.count))
-                }
+                if speaking { partial.append(contentsOf: remainder) }
+                accept(remainder, detector: detector)
                 remainder.removeAll()
             }
             SherpaOnnxVoiceActivityDetectorFlush(detector)
-            finalized += takeSegments(detector)
+            _ = consumeEndpoints(detector)
+            if speaking, !partial.isEmpty { finalized.append(partial) }
             partial.removeAll()
             speaking = false
         }
         return (finalized, Array(partial.suffix(192_000)))
     }
 
-    private func takeSegments(_ detector: OpaquePointer) -> [[Float]] {
-        var segments: [[Float]] = []
+    private func accept(_ samples: [Float], detector: OpaquePointer) {
+        // The saved AirPods recording lost speech before ASR could boost it.
+        // Condition only the VAD input; retain original audio for ASR and voices.
+        let peak = samples.reduce(Float(0)) { max($0, abs($1)) }
+        let gain = peak > 0 ? max(1, min(32, 0.95 / peak)) : 1
+        let conditioned = samples.map { $0 * gain }
+        conditioned.withUnsafeBufferPointer {
+            SherpaOnnxVoiceActivityDetectorAcceptWaveform(detector, $0.baseAddress, Int32($0.count))
+        }
+    }
+
+    private func consumeEndpoints(_ detector: OpaquePointer) -> Bool {
+        var completed = false
         while SherpaOnnxVoiceActivityDetectorEmpty(detector) == 0 {
             if let segment = SherpaOnnxVoiceActivityDetectorFront(detector) {
-                if let samples = segment.pointee.samples, segment.pointee.n > 0 {
-                    segments.append(Array(UnsafeBufferPointer(start: samples, count: Int(segment.pointee.n))))
-                }
+                completed = true
                 SherpaOnnxDestroySpeechSegment(segment)
             }
             SherpaOnnxVoiceActivityDetectorPop(detector)
         }
-        return segments
+        return completed
     }
 
 }

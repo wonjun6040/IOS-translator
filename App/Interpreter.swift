@@ -365,8 +365,17 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
                 do {
                     let parts: [SpeakerAudio]
                     if final {
-                        parts = try await self.speakers.split(samples)
+                        // Speaker boundaries label the utterance; they never crop
+                        // the original audio passed to speech recognition.
+                        let voices = try await self.speakers.split(samples)
+                        let ids = Set(voices.compactMap(\.speaker))
+                        let soleVoice = ids.count == 1 && voices.allSatisfy { $0.speaker != nil }
+                        parts = [SpeakerAudio(samples: samples,
+                            speaker: soleVoice ? ids.first : nil,
+                            similarity: soleVoice ? voices.first?.similarity : nil)]
                         self.log("speaker_segments", ["processing_seconds": Date().timeIntervalSince(started),
+                            "asr_input_split": false,
+                            "detected_speakers": ids.sorted(),
                             "parts": parts.map { ["speaker": $0.speaker ?? 0,
                                 "similarity": $0.similarity ?? -1,
                                 "audio_seconds": Double($0.samples.count) / 16_000] as [String: Any] }])
