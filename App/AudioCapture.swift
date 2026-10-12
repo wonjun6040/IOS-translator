@@ -1,5 +1,5 @@
 import Foundation
-import AVFoundation
+@preconcurrency import AVFoundation
 import AudioToolbox
 
 @MainActor
@@ -12,6 +12,7 @@ final class AudioCapture {
     var onInputSourceChanged: (() -> Void)?
     var onFailure: ((String) -> Void)?
     var onRoutingFallback: ((String) -> Void)?
+    var onInputDiagnostic: (([String: Any]) -> Void)?
     var onInputSources: (([String: Double], String) -> Void)?
     var onInputFormat: ((Double, UInt32, Bool) -> Void)?
     var onInputLevel: ((Double, Float, Double, Double?, Float?) -> Void)?
@@ -36,6 +37,13 @@ final class AudioCapture {
     private var routeFingerprint = ""
     private var observers: [NSObjectProtocol] = []
     private var rebuildTask: Task<Void, Never>?
+    private var inputWatchdog: Task<Void, Never>?
+    private var receivedFrames = 0
+    #if DEBUG
+    private let debugAudioQueue = DispatchQueue(label: "com.wonjun6040.iostranslator.debug-audio", qos: .utility)
+    private var debugASRFile: AVAudioFile?
+    private var debugASRFrames = 0
+    #endif
     private(set) var running = false
     private var speakerPlayback = false
 
@@ -183,9 +191,14 @@ final class AudioCapture {
         generation = UUID()
         rebuildTask?.cancel()
         rebuildTask = nil
+        inputWatchdog?.cancel()
+        inputWatchdog = nil
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
+        #if DEBUG
+        debugASRFile = nil
+        #endif
         capturedInputs = []
         inputPorts = []
         inputLocked = false
@@ -225,7 +238,21 @@ final class AudioCapture {
         }
         let samples = pending[activeInput]
         for index in pending.indices { pending[index].removeAll(keepingCapacity: true) }
-        return suppressInput ? [Float](repeating: 0, count: samples.count) : samples
+        let delivered = suppressInput ? [Float](repeating: 0, count: samples.count) : samples
+        #if DEBUG
+        if let file = debugASRFile, !delivered.isEmpty, debugASRFrames < 960_000,
+           let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
+               frameCapacity: AVAudioFrameCount(min(delivered.count, 960_000 - debugASRFrames))),
+           let data = buffer.floatChannelData {
+            buffer.frameLength = buffer.frameCapacity
+            delivered.withUnsafeBufferPointer { source in
+                data[0].update(from: source.baseAddress!, count: Int(buffer.frameLength))
+            }
+            debugASRFrames += Int(buffer.frameLength)
+            debugAudioQueue.async { try? file.write(from: buffer) }
+        }
+        #endif
+        return delivered
     }
 
     func selectMicrophone(_ uid: String) throws {
@@ -263,6 +290,27 @@ final class AudioCapture {
         engine = candidate
         routeFingerprint = fingerprint()
         onRouteChanged?()
+        watchForInput()
+    }
+
+    private func watchForInput() {
+        inputWatchdog?.cancel()
+        let token = generation
+        inputWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled, let self, self.running,
+                  self.generation == token, self.receivedFrames == 0 else { return }
+            self.onInputDiagnostic?(["stage": "no_samples", "engine_running": self.engine?.isRunning == true,
+                "dual_route": self.dualRouteEnabled])
+            guard self.dualRouteEnabled else {
+                self.onFailure?("마이크 입력 데이터가 도착하지 않았습니다. 통역을 다시 시작해 주세요.")
+                return
+            }
+            self.onRoutingFallback?("dual_route_no_samples: recovering to phone microphone")
+            self.dualInputUnavailable = true
+            do { try self.configureSession(); try self.rebuild() }
+            catch { self.onFailure?("마이크 입력을 복구하지 못했습니다: \(error.localizedDescription)") }
+        }
     }
 
     private func attachTapAndStart(_ candidate: AVAudioEngine) throws {
@@ -315,11 +363,12 @@ final class AudioCapture {
         inputLocked = false
         onInputFormat?(format.sampleRate, format.channelCount, input.isVoiceProcessingEnabled)
         guard let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000,
-                  channels: format.channelCount, interleaved: false),
-              let converter = AVAudioConverter(from: format, to: target) else {
+                  channels: format.channelCount, interleaved: false) else {
             throw InterpreterError.message("현재 마이크의 오디오 형식을 사용할 수 없습니다.")
         }
-        converter.channelMap = (0..<Int(format.channelCount)).map { NSNumber(value: $0) }
+        var converter: AVAudioConverter?
+        var reportedBuffer = false
+        var reportedFailure = false
         generation = UUID()
         levelFrames = 0
         levelEnergy = 0
@@ -327,12 +376,52 @@ final class AudioCapture {
         nativeLevelSamples = 0
         nativeLevelEnergy = 0
         nativeLevelPeak = 0
+        receivedFrames = 0
         let token = generation
+        #if DEBUG
+        let debugFiles = openDebugAudio(format: format, converted: target, groups: groups)
+        var debugRawFrames = 0
+        var debugConvertedFrames = 0
+        let debugQueue = debugAudioQueue
+        #endif
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            // Compare the hardware stream with the resampled stream without
-            // retaining microphone audio. An input DSP issue must not be hidden
-            // by measuring only the converter's output.
-            guard buffer.format == format, let native = buffer.floatChannelData else { return }
+            // Compare hardware and resampled levels. Authorized debug builds
+            // also retain a bounded recording of both stages.
+            if !reportedBuffer {
+                reportedBuffer = true
+                let details: [String: Any] = ["stage": "first_buffer", "sample_rate": buffer.format.sampleRate,
+                    "channels": buffer.format.channelCount, "frames": buffer.frameLength,
+                    "interleaved": buffer.format.isInterleaved,
+                    "common_format": buffer.format.commonFormat.rawValue,
+                    "matches_requested_format": buffer.format == format]
+                Task { @MainActor in
+                    guard let self, self.generation == token else { return }
+                    self.onInputDiagnostic?(details)
+                }
+            }
+            // Channel-layout metadata can differ even when the PCM stream is
+            // usable. Convert from the actual tap format rather than dropping it.
+            guard buffer.format.commonFormat == .pcmFormatFloat32, !buffer.format.isInterleaved,
+                  buffer.format.channelCount == format.channelCount,
+                  buffer.format.sampleRate > 0, let native = buffer.floatChannelData else { return }
+            #if DEBUG
+            if let file = debugFiles.raw, debugRawFrames < Int(format.sampleRate * 60),
+               let copy = AVAudioPCMBuffer(pcmFormat: format,
+                   frameCapacity: min(buffer.frameLength, AVAudioFrameCount(Int(format.sampleRate * 60) - debugRawFrames))),
+               let channels = copy.floatChannelData {
+                copy.frameLength = copy.frameCapacity
+                for channel in 0..<Int(format.channelCount) {
+                    channels[channel].update(from: native[channel], count: Int(copy.frameLength))
+                }
+                debugRawFrames += Int(copy.frameLength)
+                debugQueue.async { try? file.write(from: copy) }
+            }
+            #endif
+            if converter == nil {
+                converter = AVAudioConverter(from: buffer.format, to: target)
+                converter?.channelMap = (0..<Int(format.channelCount)).map { NSNumber(value: $0) }
+            }
+            guard let converter else { return }
             let nativeMeasurements = groups.map { channels -> (Int, Double, Float) in
                 var energy = Double(0)
                 var peak = Float(0)
@@ -343,7 +432,7 @@ final class AudioCapture {
                 }
                 return (Int(buffer.frameLength), energy, peak)
             }
-            let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * 16000 / format.sampleRate) + 16)
+            let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * 16000 / buffer.format.sampleRate) + 16)
             guard let output = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
             var supplied = false
             var error: NSError?
@@ -353,7 +442,30 @@ final class AudioCapture {
                 state.pointee = .haveData
                 return buffer
             }
-            guard error == nil, status != .error, let data = output.floatChannelData else { return }
+            guard error == nil, status != .error, let data = output.floatChannelData else {
+                if !reportedFailure {
+                    reportedFailure = true
+                    let reason = error?.localizedDescription ?? "converter status \(status.rawValue)"
+                    Task { @MainActor in
+                        guard let self, self.generation == token else { return }
+                        self.onInputDiagnostic?(["stage": "conversion_failed", "reason": reason])
+                    }
+                }
+                return
+            }
+            #if DEBUG
+            if let file = debugFiles.converted, debugConvertedFrames < 960_000,
+               let copy = AVAudioPCMBuffer(pcmFormat: target,
+                   frameCapacity: min(output.frameLength, AVAudioFrameCount(960_000 - debugConvertedFrames))),
+               let channels = copy.floatChannelData {
+                copy.frameLength = copy.frameCapacity
+                for channel in 0..<Int(target.channelCount) {
+                    channels[channel].update(from: data[channel], count: Int(copy.frameLength))
+                }
+                debugConvertedFrames += Int(copy.frameLength)
+                debugQueue.async { try? file.write(from: copy) }
+            }
+            #endif
             let sources = groups.map { channels in
                 (0..<Int(output.frameLength)).map { frame in
                     channels.reduce(Float(0)) { $0 + data[$1][frame] } / Float(channels.count)
@@ -362,8 +474,9 @@ final class AudioCapture {
             Task { @MainActor in
                 guard let self, self.running, self.generation == token else { return }
                 let samples = sources[self.activeInput]
+                self.receivedFrames += samples.count
                 let nativeMeasurement = nativeMeasurements[self.activeInput]
-                // Measure actual input before playback gating or VAD. No audio is saved.
+                // Measure actual input before playback gating or VAD.
                 self.levelFrames += samples.count
                 self.nativeLevelSamples += nativeMeasurement.0
                 self.nativeLevelEnergy += nativeMeasurement.1
@@ -405,6 +518,49 @@ final class AudioCapture {
         candidate.prepare()
         try candidate.start()
     }
+
+    #if DEBUG
+    private func openDebugAudio(format: AVAudioFormat, converted: AVAudioFormat, groups: [[Int]])
+        -> (raw: AVAudioFile?, converted: AVAudioFile?) {
+        debugASRFile = nil
+        debugASRFrames = 0
+        do {
+            let manager = FileManager.default
+            var root = manager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Diagnostics/Audio", isDirectory: true)
+            try manager.createDirectory(at: root, withIntermediateDirectories: true)
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            try root.setResourceValues(values)
+            // Keep the current capture and the preceding route/session only.
+            let previous = try manager.contentsOfDirectory(at: root,
+                includingPropertiesForKeys: [.creationDateKey], options: [.skipsHiddenFiles])
+                .sorted { (try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+                    > (try? $1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast }
+            let directory = root.appendingPathComponent(generation.uuidString, isDirectory: true)
+            let files = try debugAudioQueue.sync { () -> (AVAudioFile, AVAudioFile, AVAudioFile) in
+                for old in previous.dropFirst() { try manager.removeItem(at: old) }
+                try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+                let raw = try AVAudioFile(forWriting: directory.appendingPathComponent("native.caf"),
+                    settings: format.settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+                let resampled = try AVAudioFile(forWriting: directory.appendingPathComponent("resampled.caf"),
+                    settings: converted.settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+                let mono = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
+                let asr = try AVAudioFile(forWriting: directory.appendingPathComponent("asr-input.caf"),
+                    settings: mono.settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+                return (raw, resampled, asr)
+            }
+            debugASRFile = files.2
+            onInputDiagnostic?(["stage": "debug_audio_started", "directory": directory.lastPathComponent,
+                "channel_ports": capturedInputs, "sample_rate": format.sampleRate,
+                "channel_indices": groups, "channels": format.channelCount, "limit_seconds": 60])
+            return (files.0, files.1)
+        } catch {
+            onInputDiagnostic?(["stage": "debug_audio_failed", "reason": error.localizedDescription])
+            return (nil, nil)
+        }
+    }
+    #endif
 
     private func fingerprint() -> String {
         let session = AVAudioSession.sharedInstance()

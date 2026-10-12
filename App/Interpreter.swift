@@ -93,6 +93,7 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
         audio.onRouteChanged = { [weak self] in self?.refreshRoute() }
         audio.onInputSourceChanged = { [weak self] in self?.refreshRoute() }
         audio.onRoutingFallback = { [weak self] reason in self?.log("audio_routing_fallback", ["reason": reason]) }
+        audio.onInputDiagnostic = { [weak self] values in self?.log("audio_input_diagnostic", values) }
         audio.onInputSources = { [weak self] levels, selected in
             self?.log("audio_input_sources", ["levels_dbfs": levels, "selected": selected])
         }
