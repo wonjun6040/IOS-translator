@@ -80,8 +80,8 @@ actor SpeechRecognizer {
         let options = DecodingOptions(verbose: false, task: .transcribe, language: hint,
             temperatureFallbackCount: 0, sampleLength: 256, usePrefillPrompt: true,
             detectLanguage: hint == nil, skipSpecialTokens: true, withoutTimestamps: true,
-            // A low-confidence first token prematurely rejected the saved music/speech
-            // recordings. Keep the segment-level no-speech and confidence filters.
+            // A low-confidence first token prematurely rejected the saved recordings.
+            // Silero gates speech; evaluate confidence over the full decoded segment.
             firstTokenLogProbThreshold: nil, concurrentWorkerCount: 1)
         let results = try await withTaskCancellationHandler {
             try await pipeline.transcribe(audioArray: input, decodeOptions: options) { [cancellation] progress in
@@ -93,11 +93,14 @@ actor SpeechRecognizer {
             }
         } onCancel: { self.cancellation.withLock { $0 = true } }
         try Task.checkCancellation()
-        let text = results.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        let segments = results.flatMap(\.segments)
+        let accepted = segments.filter { $0.avgLogprob >= -1.0 }
+        let text = accepted.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         let language = results.first.flatMap { SpeechLanguages.code(for: $0.language) }
         var timings: [String: Double] = [
             "processing_seconds": Date().timeIntervalSince(started),
             "preparation_seconds": preparation,
+            "rejected_segments": Double(segments.count - accepted.count),
             "input_gain": Double(gain),
             "input_rms_dbfs": 20 * log10(max(rms, 1e-9)),
             "normalized_rms_dbfs": 20 * log10(max(rms * Double(gain), 1e-9)),
@@ -106,7 +109,6 @@ actor SpeechRecognizer {
         ]
         if let segment = results.first?.segments.first {
             timings["average_log_probability"] = Double(segment.avgLogprob)
-            timings["no_speech_probability"] = Double(segment.noSpeechProb)
         }
         if let first = results.first, first.timings.firstTokenTime > first.timings.pipelineStart {
             timings["first_decoder_prediction_seconds"] = first.timings.firstTokenTime - first.timings.pipelineStart
