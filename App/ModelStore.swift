@@ -4,8 +4,26 @@ import Observation
 @MainActor @Observable
 final class ModelStore: NSObject, URLSessionDownloadDelegate {
     nonisolated static let assets: [(path: String, url: String, size: Int64)] = [
-        ("ASR/Qwen3-ASR-1.7B.Q4_K_M.gguf", "https://huggingface.co/mradermacher/Qwen3-ASR-1.7B-GGUF/resolve/cc946c78d3804752f7ba1bc42720c0f7aaf3d1ad/Qwen3-ASR-1.7B.Q4_K_M.gguf", 1_282_435_552),
-        ("ASR/Qwen3-ASR-1.7B.mmproj-Q8_0.gguf", "https://huggingface.co/mradermacher/Qwen3-ASR-1.7B-GGUF/resolve/cc946c78d3804752f7ba1bc42720c0f7aaf3d1ad/Qwen3-ASR-1.7B.mmproj-Q8_0.gguf", 355_709_472),
+        ("ASR/WhisperTurbo/AudioEncoder.mlmodelc/analytics/coremldata.bin", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/AudioEncoder.mlmodelc/analytics/coremldata.bin", 243),
+        ("ASR/WhisperTurbo/AudioEncoder.mlmodelc/coremldata.bin", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/AudioEncoder.mlmodelc/coremldata.bin", 348),
+        ("ASR/WhisperTurbo/AudioEncoder.mlmodelc/metadata.json", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/AudioEncoder.mlmodelc/metadata.json", 1922),
+        ("ASR/WhisperTurbo/AudioEncoder.mlmodelc/model.mil", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/AudioEncoder.mlmodelc/model.mil", 934263),
+        ("ASR/WhisperTurbo/AudioEncoder.mlmodelc/weights/weight.bin", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/AudioEncoder.mlmodelc/weights/weight.bin", 421968768),
+        ("ASR/WhisperTurbo/MelSpectrogram.mlmodelc/analytics/coremldata.bin", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/MelSpectrogram.mlmodelc/analytics/coremldata.bin", 243),
+        ("ASR/WhisperTurbo/MelSpectrogram.mlmodelc/coremldata.bin", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/MelSpectrogram.mlmodelc/coremldata.bin", 329),
+        ("ASR/WhisperTurbo/MelSpectrogram.mlmodelc/metadata.json", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/MelSpectrogram.mlmodelc/metadata.json", 1850),
+        ("ASR/WhisperTurbo/MelSpectrogram.mlmodelc/model.mil", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/MelSpectrogram.mlmodelc/model.mil", 10143),
+        ("ASR/WhisperTurbo/MelSpectrogram.mlmodelc/weights/weight.bin", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/MelSpectrogram.mlmodelc/weights/weight.bin", 373376),
+        ("ASR/WhisperTurbo/TextDecoder.mlmodelc/analytics/coremldata.bin", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/TextDecoder.mlmodelc/analytics/coremldata.bin", 243),
+        ("ASR/WhisperTurbo/TextDecoder.mlmodelc/coremldata.bin", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/TextDecoder.mlmodelc/coremldata.bin", 633),
+        ("ASR/WhisperTurbo/TextDecoder.mlmodelc/metadata.json", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/TextDecoder.mlmodelc/metadata.json", 4924),
+        ("ASR/WhisperTurbo/TextDecoder.mlmodelc/model.mil", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/TextDecoder.mlmodelc/model.mil", 217177),
+        ("ASR/WhisperTurbo/TextDecoder.mlmodelc/weights/weight.bin", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/TextDecoder.mlmodelc/weights/weight.bin", 203199860),
+        ("ASR/WhisperTurbo/config.json", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/config.json", 1149),
+        ("ASR/WhisperTurbo/generation_config.json", "https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/0f63a7800b00dd0226abd051b906c246e1907482/openai_whisper-large-v3-v20240930_626MB/generation_config.json", 2767),
+        ("ASR/WhisperTurbo/special_tokens_map.json", "https://huggingface.co/openai/whisper-large-v3-turbo/resolve/41f01f3fe87f28c78e2fbf8b568835947dd65ed9/special_tokens_map.json", 2186),
+        ("ASR/WhisperTurbo/tokenizer.json", "https://huggingface.co/openai/whisper-large-v3-turbo/resolve/41f01f3fe87f28c78e2fbf8b568835947dd65ed9/tokenizer.json", 2710337),
+        ("ASR/WhisperTurbo/tokenizer_config.json", "https://huggingface.co/openai/whisper-large-v3-turbo/resolve/41f01f3fe87f28c78e2fbf8b568835947dd65ed9/tokenizer_config.json", 282843),
         ("silero_vad.onnx", "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx", 643_854),
         ("Hy-MT2-1.8B-Q4_K_M.gguf", "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/a0c709d9fac510f2c807aa3af52872340dc37a4a/Hy-MT2-1.8B-Q4_K_M.gguf", 1_133_080_448),
         ("Speaker/segmentation.int8.onnx", "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/9403a6902bb58e3d5ae8c7e77c3422de279db2e0/model.int8.onnx", 1_540_506),
@@ -17,7 +35,7 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
     }
     var downloading = false
     var progress: Double = 0
-    var message = "최초 모델 설치에 약 2.80 GB가 필요합니다."
+    var message = "최초 모델 설치에 약 1.79 GB가 필요합니다."
     var recognitionUpdateAvailable: Bool {
         !installed && Self.assets.filter { !$0.path.hasPrefix("Speaker/") && !$0.path.hasPrefix("ASR/") }.allSatisfy { asset in
             let size = try? Self.directory.appendingPathComponent(asset.path).resourceValues(forKeys: [.fileSizeKey]).fileSize

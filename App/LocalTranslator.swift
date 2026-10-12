@@ -22,7 +22,7 @@ actor LocalTranslator {
     deinit {
         if let context { llama_free(context) }
         if let model { llama_model_free(model) }
-        // The backend is shared with ASR and lives for the app process.
+        // The backend lives for the app process.
     }
 
     func load() throws {

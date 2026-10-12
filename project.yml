@@ -6,6 +6,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
+    SWIFT_OPTIMIZATION_LEVEL: "-O"
     TARGETED_DEVICE_FAMILY: "1"
     SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: false
 packages:
@@ -15,6 +16,9 @@ packages:
   LlamaSwift:
     url: https://github.com/mattt/llama.swift.git
     revision: 716419d4d7aa542fce301e809cde7234c68ddbc6
+  WhisperKit:
+    url: https://github.com/argmaxinc/WhisperKit.git
+    exactVersion: "1.1.1"
 targets:
   IOSTranslator:
     type: application
@@ -40,6 +44,8 @@ targets:
         product: sherpa-onnx
       - package: LlamaSwift
         product: LlamaSwift
+      - package: WhisperKit
+        product: WhisperKit
 schemes:
   IOSTranslator:
     build:

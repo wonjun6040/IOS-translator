@@ -12,6 +12,7 @@
 		1336520AAB211077DD9B772B /* TranslatorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6936A4B2C84EEB5DAA3B79D4 /* TranslatorView.swift */; };
 		1549E4B699E4B2759C13F938 /* NOTICE in Resources */ = {isa = PBXBuildFile; fileRef = 6288548BB16E16071D31696A /* NOTICE */; };
 		1B51019BD0F03C3B0451FD20 /* ModelStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C13F665632028E777990F87 /* ModelStore.swift */; };
+		23FB06B318B080D1365C6CFC /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = 6D71B4F610DD9A6BF9948996 /* WhisperKit */; };
 		6E55D5C51AB6C4D2A1010F14 /* SpeakerRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 232EFBFD64C54D411AA65F2D /* SpeakerRecognizer.swift */; };
 		9A64A048E566AABDFEF870D9 /* AudioCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5876AB349B75030675C9142A /* AudioCapture.swift */; };
 		A9EB91FEB2F613B263B70CB3 /* LocalTranslator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16C99579B83F749CBAEF0975 /* LocalTranslator.swift */; };
@@ -42,6 +43,7 @@
 			files = (
 				F2750CF539F8E1F2550D562D /* sherpa-onnx in Frameworks */,
 				C9B0CD25DE3F06D24BD15254 /* LlamaSwift in Frameworks */,
+				23FB06B318B080D1365C6CFC /* WhisperKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -100,6 +102,7 @@
 			packageProductDependencies = (
 				3306A453B06D5DBCD1966D56 /* sherpa-onnx */,
 				43828C55B5AAAEB580AF93BD /* LlamaSwift */,
+				6D71B4F610DD9A6BF9948996 /* WhisperKit */,
 			);
 			productName = IOSTranslator;
 			productReference = 85F1F3502A2B7541F4627936 /* IOSTranslator.app */;
@@ -132,6 +135,7 @@
 			packageReferences = (
 				0334EA38326C0D698DFBDF9D /* XCRemoteSwiftPackageReference "llama.swift" */,
 				2F09ECB87FD022324F8383A2 /* XCRemoteSwiftPackageReference "sherpa-onnx" */,
+				8A004D58556D48B87EDE6D6F /* XCRemoteSwiftPackageReference "WhisperKit" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = B634D7F1C83515FBA517469A /* Products */;
@@ -311,7 +315,7 @@
 				SDKROOT = iphoneos;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
-				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
 			};
@@ -377,6 +381,14 @@
 				version = 1.13.8;
 			};
 		};
+		8A004D58556D48B87EDE6D6F /* XCRemoteSwiftPackageReference "WhisperKit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/argmaxinc/WhisperKit.git";
+			requirement = {
+				kind = exactVersion;
+				version = 1.1.1;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -389,6 +401,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 0334EA38326C0D698DFBDF9D /* XCRemoteSwiftPackageReference "llama.swift" */;
 			productName = LlamaSwift;
+		};
+		6D71B4F610DD9A6BF9948996 /* WhisperKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 8A004D58556D48B87EDE6D6F /* XCRemoteSwiftPackageReference "WhisperKit" */;
+			productName = WhisperKit;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

@@ -1,11 +1,12 @@
 import Foundation
 import SherpaOnnx
 import SherpaOnnxC
-import LlamaSwift
+import WhisperKit
+import ArgmaxCore
 import os
 
 enum SpeechLanguages {
-    // Qwen3-ASR's 30 languages; Chinese regional dialects share the Chinese entry.
+    // Languages available in the conversation picker.
     static let supported: [(code: String, name: String, label: String)] = [
         ("ko", "Korean", "한국어"), ("en", "English", "English"), ("ja", "Japanese", "日本語"),
         ("zh", "Chinese", "중국어"), ("yue", "Cantonese", "광둥어"), ("ar", "Arabic", "아랍어"),
@@ -20,17 +21,7 @@ enum SpeechLanguages {
         ("mk", "Macedonian", "마케도니아어"), ("ro", "Romanian", "루마니아어")
     ]
 
-    static func code(for raw: String, transcript: String? = nil) -> String? {
-        // The acoustic language tag can contradict the generated script.
-        // Correct only unambiguous Japanese/Korean text, without another ASR.
-        if let transcript {
-            let letters = transcript.unicodeScalars.filter { $0.properties.isAlphabetic }
-            let kana = letters.filter { (0x3040...0x30FF).contains($0.value) || (0x31F0...0x31FF).contains($0.value) }.count
-            let han = letters.filter { (0x4E00...0x9FFF).contains($0.value) }.count
-            let hangul = letters.filter { (0xAC00...0xD7A3).contains($0.value) }.count
-            if kana >= 3, kana * 3 >= letters.count, (kana + han) * 2 > letters.count { return "ja" }
-            if hangul >= 3, hangul * 2 > letters.count { return "ko" }
-        }
+    static func code(for raw: String) -> String? {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if value == "tagalog" || value == "tl" { return "fil" }
         return supported.first { $0.code == value || $0.name.lowercased() == value }?.code
@@ -42,249 +33,89 @@ enum SpeechLanguages {
 }
 
 actor SpeechRecognizer {
-    static let modelName = "Qwen3-ASR-1.7B-Q4_K_M"
-    private var model: OpaquePointer?
-    private var context: OpaquePointer?
-    private var audioEncoder: OpaquePointer?
+    static let modelName = "Whisper-large-v3-turbo-626MB"
+    private var pipeline: WhisperKit?
+    private var decoding = false
     private nonisolated let cancellation = OSAllocatedUnfairLock(initialState: false)
-    private let abortFlag: UnsafeMutablePointer<OSAllocatedUnfairLock<Bool>>
 
-    init() {
-        abortFlag = .allocate(capacity: 1)
-        // A copy shares the same allocated lock/state; C keeps this stable address.
-        abortFlag.initialize(to: cancellation)
-        llama_backend_init()
-    }
-
-    deinit {
-        if let audioEncoder { mtmd_free(audioEncoder) }
-        if let context { llama_free(context) }
-        if let model { llama_model_free(model) }
-        abortFlag.deinitialize(count: 1)
-        abortFlag.deallocate()
-        // The backend is shared with translation and lives for the app process.
-    }
-
-    func load() throws {
-        guard context == nil else { return }
-        let directory = ModelStore.directory.appendingPathComponent("ASR")
-        var modelParams = llama_model_default_params()
-        modelParams.n_gpu_layers = 0
-        guard let loadedModel = llama_model_load_from_file(
-            directory.appendingPathComponent("Qwen3-ASR-1.7B.Q4_K_M.gguf").path, modelParams) else {
-            throw InterpreterError.message("음성 인식 모델을 불러오지 못했습니다.")
-        }
-        var params = llama_context_default_params()
-        params.n_ctx = 1024
-        params.n_batch = 256
-        params.n_ubatch = 256
-        params.n_threads = 2
-        params.n_threads_batch = 4
-        params.offload_kqv = false
-        params.op_offload = false
-        params.abort_callback = { data in
-            guard let data else { return false }
-            return data.assumingMemoryBound(to: OSAllocatedUnfairLock<Bool>.self).pointee.withLock { $0 }
-        }
-        params.abort_callback_data = UnsafeMutableRawPointer(abortFlag)
-        guard let loadedContext = llama_init_from_model(loadedModel, params) else {
-            llama_model_free(loadedModel)
-            throw InterpreterError.message("음성 인식에 필요한 메모리를 확보하지 못했습니다.")
-        }
-        var audioParams = mtmd_context_params_default()
-        audioParams.use_gpu = false
-        audioParams.n_threads = 4
-        audioParams.warmup = false
-        guard let loadedEncoder = mtmd_init_from_file(
-            directory.appendingPathComponent("Qwen3-ASR-1.7B.mmproj-Q8_0.gguf").path,
-            loadedModel, audioParams) else {
-            llama_free(loadedContext)
-            llama_model_free(loadedModel)
-            throw InterpreterError.message("음성 처리 모델을 불러오지 못했습니다.")
-        }
-        guard mtmd_support_audio(loadedEncoder), mtmd_get_audio_sample_rate(loadedEncoder) == 16000 else {
-            mtmd_free(loadedEncoder)
-            llama_free(loadedContext)
-            llama_model_free(loadedModel)
-            throw InterpreterError.message("음성 모델의 입력 형식이 맞지 않습니다.")
-        }
-        model = loadedModel
-        context = loadedContext
-        audioEncoder = loadedEncoder
+    func load() async throws {
+        guard pipeline == nil else { return }
+        let directory = ModelStore.directory.appendingPathComponent("ASR/WhisperTurbo")
+        // Fail locally if the tokenizer is invalid, before the SDK's Hub fallback.
+        _ = try await AutoTokenizerWrapper.from(modelFolder: directory)
+        let compute = ModelComputeOptions(melCompute: .cpuOnly,
+            audioEncoderCompute: .cpuAndNeuralEngine, textDecoderCompute: .cpuAndNeuralEngine)
+        let config = WhisperKitConfig(modelFolder: directory.path, tokenizerFolder: directory,
+            computeOptions: compute, verbose: false, logLevel: .error,
+            prewarm: false, load: false, download: false)
+        let loaded = try await WhisperKit(config)
+        loaded.tokenizer = try await ModelUtilities.loadTokenizer(for: .largev3,
+            tokenizerFolder: directory, additionalSearchPaths: [directory])
+        loaded.textDecoder.isModelMultilingual = true
+        try await loaded.loadModels()
+        pipeline = loaded
     }
 
     func transcribe(_ samples: [Float], languageHint: String? = nil,
-                   onPartial: @Sendable (String, String?) -> Void = { _, _ in }) async throws
-        -> (text: String, language: String?, timings: [String: Double]) {
-        try Task.checkCancellation()
-        cancellation.withLock { $0 = false }
-        return try await withTaskCancellationHandler {
-            try decode(samples, languageHint: languageHint, onPartial: onPartial)
-        } onCancel: {
-            self.cancellation.withLock { $0 = true }
-        }
-    }
-
-    private func decode(_ samples: [Float], languageHint: String?,
-                        onPartial: @Sendable (String, String?) -> Void)
-        throws -> (text: String, language: String?, timings: [String: Double]) {
+        onPartial: @escaping @Sendable (String, String?) -> Void = { _, _ in }
+    ) async throws -> (text: String, language: String?, timings: [String: Double]) {
         try Task.checkCancellation()
         guard !samples.isEmpty else { return ("", nil, [:]) }
-        let preparationStarted = Date()
-        guard let model, let context, let audioEncoder, let vocab = llama_model_get_vocab(model) else {
-            throw InterpreterError.message("음성 인식이 준비되지 않았습니다.")
-        }
-        guard let bitmap = samples.withUnsafeBufferPointer({ mtmd_bitmap_init_from_audio($0.count, $0.baseAddress) }) else {
-            throw InterpreterError.message("입력 음성을 처리하지 못했습니다.")
-        }
-        defer { mtmd_bitmap_free(bitmap) }
-        guard let chunks = mtmd_input_chunks_init() else {
-            throw InterpreterError.message("입력 음성을 처리하지 못했습니다.")
-        }
-        defer { mtmd_input_chunks_free(chunks) }
-        let languageName = SpeechLanguages.supported.first { $0.code == languageHint }?.name
-        // Qwen's own ASR template, including its acoustic language prediction.
-        let prefix = languageName.map { "language \($0)<asr_text>" } ?? ""
-        let prompt = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n"
-            + String(cString: mtmd_default_marker())
-            + "<|im_end|>\n<|im_start|>assistant\n" + prefix
-        let result = prompt.withCString { pointer in
-            var input = mtmd_input_text(text: pointer, text_len: prompt.utf8.count,
-                add_special: false, parse_special: true)
-            var bitmaps: [OpaquePointer?] = [bitmap]
-            return bitmaps.withUnsafeMutableBufferPointer {
-                mtmd_tokenize(audioEncoder, chunks, &input, $0.baseAddress, $0.count)
+        guard let pipeline else { throw InterpreterError.message("음성 인식 모델이 준비되지 않았습니다.") }
+        guard !decoding else { throw InterpreterError.message("이전 음성 인식을 처리하고 있습니다.") }
+        decoding = true
+        defer { decoding = false }
+        cancellation.withLock { $0 = false }
+        let started = Date()
+        let energy = samples.reduce(0.0) { $0 + Double($1) * Double($1) }
+        let rms = sqrt(energy / Double(samples.count))
+        let peak = samples.reduce(Float(0)) { max($0, abs($1)) }
+        // Quiet microphone recordings failed decoding despite containing speech.
+        // Boost only audible input; cap the gain and leave headroom against clipping.
+        let gain: Float = rms > 0.0003 && peak > 0
+            ? max(1, min(32, min(Float(0.075 / rms), 0.95 / peak))) : 1
+        let input = gain > 1 ? samples.map { $0 * gain } : samples
+        let preparation = Date().timeIntervalSince(started)
+        let hint = languageHint == "fil" ? "tl" : languageHint
+        let options = DecodingOptions(verbose: false, task: .transcribe, language: hint,
+            temperatureFallbackCount: 0, sampleLength: 256, usePrefillPrompt: true,
+            detectLanguage: hint == nil, skipSpecialTokens: true, withoutTimestamps: true,
+            // A low-confidence first token prematurely rejected the saved music/speech
+            // recordings. Keep the segment-level no-speech and confidence filters.
+            firstTokenLogProbThreshold: nil, concurrentWorkerCount: 1)
+        let results = try await withTaskCancellationHandler {
+            try await pipeline.transcribe(audioArray: input, decodeOptions: options) { [cancellation] progress in
+                guard !cancellation.withLock({ $0 }) else { return false }
+                let text = progress.text.replacingOccurrences(of: #"<\|[^|]+\|>"#,
+                    with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty { onPartial(text, languageHint) }
+                return true
             }
-        }
-        let outputLimit = 256
-        guard result == 0 else {
-            throw InterpreterError.message("입력 음성을 처리하지 못했습니다.")
-        }
-        guard Int(mtmd_helper_get_n_pos(chunks)) + outputLimit <= Int(llama_n_ctx(context)) else {
-            throw InterpreterError.message("입력 음성이 너무 깁니다. 잠시 끊어서 말씀해 주세요.")
-        }
-        llama_memory_clear(llama_get_memory(context), true)
-        defer { llama_memory_clear(llama_get_memory(context), true) }
-        let evaluationStarted = Date()
-        var position: llama_pos = 0
-        var encodingSeconds = Double(0)
-        var prefillSeconds = Double(0)
-        var audioTokens = 0
-        let chunkCount = mtmd_input_chunks_size(chunks)
-        for index in 0..<chunkCount {
-            try Task.checkCancellation()
-            guard let chunk = mtmd_input_chunks_get(chunks, index) else {
-                throw InterpreterError.message("입력 음성을 처리하지 못했습니다.")
-            }
-            let status: Int32
-            if mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_AUDIO {
-                audioTokens += Int(mtmd_input_chunk_get_n_tokens(chunk))
-                let started = Date()
-                let encoded = mtmd_encode_chunk(audioEncoder, chunk)
-                encodingSeconds += Date().timeIntervalSince(started)
-                // Stop a superseded preview before its embeddings reach the LLM.
-                try Task.checkCancellation()
-                guard encoded == 0, let embeddings = mtmd_get_output_embd(audioEncoder) else {
-                    throw InterpreterError.message("음성 인코딩이 실패했습니다.")
-                }
-                let prefillStarted = Date()
-                status = mtmd_helper_decode_image_chunk(audioEncoder, context, chunk, embeddings,
-                    position, 0, 256, &position, nil, nil)
-                prefillSeconds += Date().timeIntervalSince(prefillStarted)
-            } else {
-                let started = Date()
-                status = mtmd_helper_eval_chunk_single(audioEncoder, context, chunk, position, 0,
-                    256, index == chunkCount - 1, &position)
-                prefillSeconds += Date().timeIntervalSince(started)
-            }
-            try Task.checkCancellation()
-            guard status == 0 else {
-                throw InterpreterError.message("음성 인식 처리가 실패했습니다.")
-            }
-        }
-        let decodingStarted = Date()
+        } onCancel: { self.cancellation.withLock { $0 = true } }
         try Task.checkCancellation()
-        guard let sampler = llama_sampler_init_greedy() else {
-            throw InterpreterError.message("음성 인식 처리가 준비되지 않았습니다.")
+        let text = results.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        let language = results.first.flatMap { SpeechLanguages.code(for: $0.language) }
+        var timings: [String: Double] = [
+            "processing_seconds": Date().timeIntervalSince(started),
+            "preparation_seconds": preparation,
+            "input_gain": Double(gain),
+            "input_rms_dbfs": 20 * log10(max(rms, 1e-9)),
+            "normalized_rms_dbfs": 20 * log10(max(rms * Double(gain), 1e-9)),
+            "audio_encoding_seconds": results.reduce(0) { $0 + $1.timings.encoding },
+            "window_processing_seconds": results.reduce(0) { $0 + $1.timings.decodingLoop }
+        ]
+        if let segment = results.first?.segments.first {
+            timings["average_log_probability"] = Double(segment.avgLogprob)
+            timings["no_speech_probability"] = Double(segment.noSpeechProb)
         }
-        defer { llama_sampler_free(sampler) }
-        var batch = llama_batch_init(1, 0, 1)
-        defer { llama_batch_free(batch) }
-        var bytes: [UInt8] = []
-        var completed = false
-        var outputTokens = 0
-        var publishedAt = Date.distantPast
-        var firstTextAt: Date?
-        for _ in 0..<outputLimit {
-            try Task.checkCancellation()
-            let token = llama_sampler_sample(sampler, context, -1)
-            if llama_vocab_is_eog(vocab, token) { completed = true; break }
-            var piece = [CChar](repeating: 0, count: 256)
-            var length = piece.withUnsafeMutableBufferPointer {
-                llama_token_to_piece(vocab, token, $0.baseAddress, Int32($0.count), 0, true)
-            }
-            if length < 0 {
-                piece = [CChar](repeating: 0, count: Int(-length))
-                length = piece.withUnsafeMutableBufferPointer {
-                    llama_token_to_piece(vocab, token, $0.baseAddress, Int32($0.count), 0, true)
-                }
-            }
-            guard length >= 0 else { throw InterpreterError.message("음성 인식 결과를 읽지 못했습니다.") }
-            bytes.append(contentsOf: piece.prefix(Int(length)).map { UInt8(bitPattern: $0) })
-            outputTokens += 1
-            if Date().timeIntervalSince(publishedAt) >= 0.12,
-               let decoded = String(bytes: bytes, encoding: .utf8) {
-                let output = prefix + decoded
-                if let marker = output.range(of: "<asr_text>") {
-                    let text = String(output[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    let language = String(output[..<marker.lowerBound]).replacingOccurrences(of: "language ", with: "")
-                    if !text.isEmpty, !text.contains("<|") {
-                        if firstTextAt == nil { firstTextAt = Date() }
-                        onPartial(text, SpeechLanguages.code(for: language,
-                            transcript: languageHint == nil ? text : nil))
-                    }
-                }
-                publishedAt = Date()
-            }
-            batch.n_tokens = 1
-            batch.token[0] = token
-            batch.pos[0] = position
-            batch.n_seq_id[0] = 1
-            batch.seq_id[0]![0] = 0
-            batch.logits[0] = 1
-            let status = llama_decode(context, batch)
-            try Task.checkCancellation()
-            guard status == 0 else {
-                throw InterpreterError.message("음성 인식 처리가 실패했습니다.")
-            }
-            position += 1
+        if let first = results.first, first.timings.firstTokenTime > first.timings.pipelineStart {
+            timings["first_decoder_prediction_seconds"] = first.timings.firstTokenTime - first.timings.pipelineStart
         }
-        guard completed, let decoded = String(bytes: bytes, encoding: .utf8) else {
-            throw InterpreterError.message("음성 인식을 끝내지 못했습니다. 다시 말씀해 주세요.")
-        }
-        var timings = ["preparation_seconds": evaluationStarted.timeIntervalSince(preparationStarted),
-            "audio_prefill_seconds": decodingStarted.timeIntervalSince(evaluationStarted),
-            "audio_encoding_seconds": encodingSeconds, "model_prefill_seconds": prefillSeconds,
-            "audio_tokens": Double(audioTokens), "prompt_positions": Double(mtmd_helper_get_n_pos(chunks)),
-            "generation_seconds": Date().timeIntervalSince(decodingStarted), "output_tokens": Double(outputTokens)]
-        if let firstTextAt { timings["first_text_seconds"] = firstTextAt.timeIntervalSince(preparationStarted) }
-        if decoded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return ("", languageHint, timings) }
-        let output = prefix + decoded
-        guard let marker = output.range(of: "<asr_text>") else {
-            throw InterpreterError.message("음성 인식 결과의 형식이 맞지 않습니다.")
-        }
-        let rawLanguage = String(output[..<marker.lowerBound])
-            .replacingOccurrences(of: "language ", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let text = String(output[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        let predictedLanguage = SpeechLanguages.code(for: rawLanguage)
-        let language = SpeechLanguages.code(for: rawLanguage, transcript: languageHint == nil ? text : nil)
-        timings["language_header_corrected"] = language == predictedLanguage ? 0 : 1
         return (text, language, timings)
     }
 }
 
-/// VAD continues consuming microphone frames while Qwen is decoding a previous chunk.
+/// VAD continues consuming microphone frames while Whisper decodes a previous chunk.
 actor SpeechDetector {
     private var detector: OpaquePointer?
     private var remainder: [Float] = []

@@ -142,8 +142,11 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
             if download || models.recognitionUpdateAvailable { try await models.download() }
             guard models.installed else { return }
             try await detector.load()
+            let recognitionLoadStarted = Date()
+            log("asr_model_loading", ["model": SpeechRecognizer.modelName])
             try await recognition.load()
-            log("asr_model_loaded", ["model": SpeechRecognizer.modelName])
+            log("asr_model_loaded", ["model": SpeechRecognizer.modelName,
+                "seconds": Date().timeIntervalSince(recognitionLoadStarted), "compute": "cpu_and_neural_engine"])
             try await speakers.load()
             wearerSpeakerID = await speakers.wearerID()
             try await translator.load()
