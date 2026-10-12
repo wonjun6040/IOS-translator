@@ -153,7 +153,11 @@ final class Interpreter: NSObject, AVSpeechSynthesizerDelegate {
                 if bytes > 0 { log("model_cache_pruned", ["bytes": bytes]) }
             } catch { log("model_cache_cleanup_failed", ["message": error.localizedDescription]) }
             ready = true
-        } catch { ready = false; message = error.localizedDescription }
+        } catch {
+            ready = false
+            message = error.localizedDescription
+            log("model_prepare_error", ["error": error.localizedDescription])
+        }
     }
 
     func start() async {

@@ -20,7 +20,17 @@ enum SpeechLanguages {
         ("mk", "Macedonian", "마케도니아어"), ("ro", "Romanian", "루마니아어")
     ]
 
-    static func code(for raw: String) -> String? {
+    static func code(for raw: String, transcript: String? = nil) -> String? {
+        // The acoustic language tag can contradict the generated script.
+        // Correct only unambiguous Japanese/Korean text, without another ASR.
+        if let transcript {
+            let letters = transcript.unicodeScalars.filter { $0.properties.isAlphabetic }
+            let kana = letters.filter { (0x3040...0x30FF).contains($0.value) || (0x31F0...0x31FF).contains($0.value) }.count
+            let han = letters.filter { (0x4E00...0x9FFF).contains($0.value) }.count
+            let hangul = letters.filter { (0xAC00...0xD7A3).contains($0.value) }.count
+            if kana >= 3, kana * 3 >= letters.count, (kana + han) * 2 > letters.count { return "ja" }
+            if hangul >= 3, hangul * 2 > letters.count { return "ko" }
+        }
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if value == "tagalog" || value == "tl" { return "fil" }
         return supported.first { $0.code == value || $0.name.lowercased() == value }?.code
@@ -230,7 +240,8 @@ actor SpeechRecognizer {
                     let language = String(output[..<marker.lowerBound]).replacingOccurrences(of: "language ", with: "")
                     if !text.isEmpty, !text.contains("<|") {
                         if firstTextAt == nil { firstTextAt = Date() }
-                        onPartial(text, SpeechLanguages.code(for: language))
+                        onPartial(text, SpeechLanguages.code(for: language,
+                            transcript: languageHint == nil ? text : nil))
                     }
                 }
                 publishedAt = Date()
@@ -266,7 +277,10 @@ actor SpeechRecognizer {
             .replacingOccurrences(of: "language ", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let text = String(output[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        return (text, SpeechLanguages.code(for: rawLanguage), timings)
+        let predictedLanguage = SpeechLanguages.code(for: rawLanguage)
+        let language = SpeechLanguages.code(for: rawLanguage, transcript: languageHint == nil ? text : nil)
+        timings["language_header_corrected"] = language == predictedLanguage ? 0 : 1
+        return (text, language, timings)
     }
 }
 
